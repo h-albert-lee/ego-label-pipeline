@@ -13,6 +13,7 @@ from egoownership.schema import (
     Relation,
     SceneRecord,
     Taxonomy,
+    VLMJudgement,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "Relation",
     "SceneRecord",
     "Taxonomy",
+    "VLMJudgement",
 ]

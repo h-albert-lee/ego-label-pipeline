@@ -1,0 +1,41 @@
+{
+  "clips": [
+    {
+      "clip_uid": "clip_putdown",
+      "video_uid": "video_A",
+      "annotations": [
+        {
+          "unique_id": "ann_pd",
+          "verb": "put_down",
+          "narration_text": "Put down the cup",
+          "objects": [{"object_type": "cup"}],
+          "pre_frame": {
+            "time": 10.0,
+            "image_width": 1920,
+            "image_height": 1080,
+            "boxes": [
+              {"object_type": "cup", "bbox": [800, 700, 1100, 950], "image_width": 1920, "image_height": 1080},
+              {"object_type": "hand", "bbox": [780, 740, 1130, 1000], "is_hand": true, "image_width": 1920, "image_height": 1080}
+            ]
+          },
+          "pnr_frame": {
+            "time": 10.4,
+            "image_width": 1920,
+            "image_height": 1080,
+            "boxes": [
+              {"object_type": "cup", "bbox": [820, 600, 1120, 850], "image_width": 1920, "image_height": 1080}
+            ]
+          },
+          "post_frame": {
+            "time": 10.8,
+            "image_width": 1920,
+            "image_height": 1080,
+            "boxes": [
+              {"object_type": "cup", "bbox": [840, 500, 1140, 750], "image_width": 1920, "image_height": 1080}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

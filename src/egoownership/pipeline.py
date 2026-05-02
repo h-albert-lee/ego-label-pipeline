@@ -111,6 +111,25 @@ def _frame_path_for(cand: ClipCandidate, frames_root: Path, tag: str) -> Path:
     return frames_root / cand.dataset / (cand.video_id or "_") / f"{safe_clip}__{tag}.jpg"
 
 
+def stage_detect_native(
+    candidates_path: Path,
+    annotations_path: Path,
+    dataset: str,
+    out_path: Path,
+) -> int:
+    """No-model path: pull bboxes straight from the dataset annotations.
+
+    Use this when you don't have GPU access or when you want a smoke-test run
+    on real data before committing to the full model stack. Output schema is
+    identical to ``stage_detect``, so ``stage_label`` can consume it as-is.
+    """
+    from egoownership.detection.native_bbox import stage_native_detect
+
+    candidates = list(load_candidates(candidates_path))
+    records = stage_native_detect(candidates, Path(annotations_path), dataset)
+    return write_jsonl(out_path, records)
+
+
 def stage_detect(
     candidates_path: Path,
     frames_root: Path,
@@ -122,6 +141,7 @@ def stage_detect(
     extract_attrs: bool = False,
     estimate_depth: bool = False,
     use_sam2_video: bool = False,
+    remote_vlm_provider: str | None = None,
 ) -> int:
     """Run the *visual evidence* stage.
 
@@ -147,10 +167,14 @@ def stage_detect(
     cfg = load_config()
     dino_cfg = DinoConfig()
 
+    remote_vlm = None
+    if remote_vlm_provider:
+        from egoownership.detection.remote_vlm import get_client
+        remote_vlm = get_client(remote_vlm_provider)
+
     records: list[dict] = []
     count = 0
     for cand in load_candidates(candidates_path):
-        # 1. Build prompt: clip nouns optionally augmented by RAM.
         nouns = list(cand.nouns)
         prompt_nouns = nouns
         times = [
@@ -167,8 +191,13 @@ def stage_detect(
                 continue
             per_frame_paths.append(fp)
             if use_ram:
-                from egoownership.detection.ram import extract_tags, merge_with_clip_nouns
-                ram_tags = extract_tags(fp)
+                # Prefer remote VLM tagging when available; fall back to local RAM.
+                if remote_vlm is not None:
+                    ram_tags = remote_vlm.tag_frame(fp)
+                else:
+                    from egoownership.detection.ram import extract_tags
+                    ram_tags = extract_tags(fp)
+                from egoownership.detection.ram import merge_with_clip_nouns
                 prompt_nouns = merge_with_clip_nouns(nouns, ram_tags)
             prompt = build_prompt(prompt_nouns)
             detections = detect_objects(fp, prompt, dino_cfg)
@@ -226,9 +255,13 @@ def stage_detect(
 
         # 6. Optional VLM attributes.
         if extract_attrs:
-            from egoownership.detection.attributes import annotate_frame_objects
-            for fd, fp in zip(frames, per_frame_paths):
-                fd.objects = annotate_frame_objects(fp, fd.objects)
+            if remote_vlm is not None:
+                for fd, fp in zip(frames, per_frame_paths):
+                    fd.objects = remote_vlm.annotate_frame(fp, fd.objects)
+            else:
+                from egoownership.detection.attributes import annotate_frame_objects
+                for fd, fp in zip(frames, per_frame_paths):
+                    fd.objects = annotate_frame_objects(fp, fd.objects)
 
         # 7. Scene graph relations.
         frames = build_scene_graph(frames)
@@ -246,16 +279,34 @@ def stage_detect(
     return count
 
 
-def stage_label(detections_path: Path, out_path: Path) -> int:
+def stage_label(
+    detections_path: Path,
+    out_path: Path,
+    *,
+    remote_vlm_judge: str | None = None,
+    frames_root: Path | None = None,
+) -> int:
+    """Apply the ownership rule cascade to the detect output.
+
+    When ``remote_vlm_judge`` is set (e.g. ``"anthropic"``), each scene also
+    gets a second-opinion VLM label stored in ``scene_record.vlm_judgement``.
+    Requires ``frames_root`` so the VLM can read the actual frame images.
+    """
     from egoownership.detection.ownership import assign_ownership, build_scene_record
     from egoownership.detection.tracking import assign_instance_ids
+    from egoownership.schema import OwnershipLabel, VLMJudgement
+
+    judge = None
+    if remote_vlm_judge:
+        if frames_root is None:
+            raise ValueError("--frames-root is required when --remote-vlm-judge is set")
+        from egoownership.detection.remote_vlm import get_client
+        judge = (remote_vlm_judge, get_client(remote_vlm_judge))
 
     records: list[dict] = []
     for d in read_jsonl(detections_path):
         clip = ClipCandidate.model_validate(d["clip"])
         frames = [FrameDetections.model_validate(fd) for fd in d["frames"]]
-        # If the upstream stage didn't already track instances, do it now —
-        # build_scene_record needs instance_ids to derive a scene label.
         needs_tracking = any(
             o.instance_id is None for fd in frames for o in fd.objects
         )
@@ -264,5 +315,29 @@ def stage_label(detections_path: Path, out_path: Path) -> int:
         depth_bands = d.get("depth_bands")
         frames_with_own = assign_ownership(frames, wearer_depth_bands=depth_bands)
         scene: SceneRecord = build_scene_record(clip, frames_with_own)
+
+        if judge is not None:
+            provider, vlm = judge
+            paths = [
+                Path(frames_root) / fd.frame_path
+                for fd in frames_with_own
+                if fd.frame_path
+            ]
+            if len(paths) == len(frames_with_own):
+                try:
+                    result = vlm.judge_scene(clip, paths, scene_graph=frames_with_own)
+                    scene = scene.model_copy(update={
+                        "vlm_judgement": VLMJudgement(
+                            provider=provider,
+                            model=getattr(vlm.cfg, "model", "unknown"),
+                            label=OwnershipLabel(result.get("label", "AMBIGUOUS")),
+                            confidence=float(result.get("confidence") or 0.0),
+                            rationale=result.get("rationale"),
+                            target_instance_hint=result.get("target_instance_hint"),
+                        )
+                    })
+                except Exception as e:  # noqa: BLE001
+                    print(f"[warn] VLM judge failed for {clip.clip_id}: {e}")
+
         records.append(scene.model_dump(mode="json"))
     return write_jsonl(out_path, records)

@@ -21,18 +21,20 @@ Label space: `MINE`, `PERSON_k`, `SHARED`, `AMBIGUOUS`.
 ## Pipeline (top-down view)
 
 ```
-filter → extract-frames → detect ─┬─ Grounding DINO (clip nouns + RAM bottom-up)
-                                  ├─ optional SAM2 mask refinement
-                                  ├─ person detector → identity propagation
-                                  ├─ instance tracking (IoU + singleton fallback,
-                                  │                     SAM2 video optional)
-                                  ├─ optional Depth Anything v2
-                                  ├─ optional VLM attribute extraction (Q1)
-                                  └─ scene graph (next_to / held_by / moved_to)
+filter → extract-frames → detect ─┬─ A. NATIVE: dataset-supplied bboxes (no GPU)
+                                  ├─ B. LOCAL MODELS: DINO + RAM + SAM + Person
+                                  │                  + Depth + BLIP-2 + scene graph
+                                  └─ C. REMOTE VLM: Claude Opus 4.7 / GPT-4o
+                                       (replaces RAM/BLIP-2; or scene judge)
         → label  ─ rule-based ownership over instance trajectories
+                  ─ optional remote-VLM second opinion → vlm_judgement
                   ─ Taxonomy D auto-flag for symmetric duplicates
         → serve  ─ FastAPI + vanilla-JS UI for collaborative review
 ```
+
+Three detect modes mix freely. Common path: A for fast smoke-test → B for the
+full visual evidence stack → add C for attribute extraction or scene-level
+second opinions.
 
 Stages communicate via JSONL; every step is resumable.
 

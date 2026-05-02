@@ -175,14 +175,30 @@ class AnnotationEdit(BaseModel):
     note: str | None = None
 
 
+class VLMJudgement(BaseModel):
+    """A second-opinion ownership label proposed by a remote VLM (Claude / GPT-4o).
+
+    Stored alongside the rule-cascade label, never replacing it. Surfaces in
+    the annotator UI so reviewers can compare the two signals.
+    """
+
+    provider: str  # "anthropic" | "openai"
+    model: str
+    label: OwnershipLabel
+    confidence: float
+    rationale: str | None = None
+    target_instance_hint: str | None = None
+
+
 class SceneRecord(BaseModel):
     """Final record that lands in the benchmark."""
 
     clip: ClipCandidate
     frames: list[FrameDetections]
     scene_label: OwnershipLabel | None = None
-    scene_taxonomy: Taxonomy | None = None  # may differ from clip.taxonomy after review
+    scene_taxonomy: Taxonomy | None = None
     notes: str | None = None
     auto_label_confidence: float | None = None
     review_status: Literal["draft", "in_review", "verified", "rejected"] = "draft"
     edits: list[AnnotationEdit] = Field(default_factory=list)
+    vlm_judgement: VLMJudgement | None = None

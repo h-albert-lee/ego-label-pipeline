@@ -31,6 +31,8 @@ detect = [
     "accelerate>=0.30",
 ]
 ram = ["transformers>=4.45"]
+remote-anthropic = ["anthropic>=0.40", "pillow>=10.2"]
+remote-openai = ["openai>=1.50", "pillow>=10.2"]
 serve = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.30",

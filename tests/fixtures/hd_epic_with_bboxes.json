@@ -1,0 +1,20 @@
+{
+  "video_id": "P05_02",
+  "fps": 60.0,
+  "image_width": 1920,
+  "image_height": 1080,
+  "tracks": [
+    {
+      "track_id": 7,
+      "object": "notebook",
+      "movement_type": "transfer",
+      "start_frame": 600,
+      "end_frame": 660,
+      "bboxes": {
+        "600": [1100, 700, 1400, 950],
+        "630": [900, 600, 1200, 850],
+        "660": [400, 400, 700, 650]
+      }
+    }
+  ]
+}

@@ -126,3 +126,29 @@ def test_list_filter_by_status(client: TestClient):
     in_review = client.get("/api/scenes?status=in_review").json()
     assert len(drafts) == 0
     assert len(in_review) == 1
+
+
+def test_runtime_config_exposes_video_availability(client: TestClient):
+    cfg = client.get("/api/config").json()
+    assert "videos_available" in cfg
+    assert cfg["videos_available"] is False  # fixture has no videos_root
+
+
+def test_next_draft_returns_pending_clip(client: TestClient):
+    res = client.get("/api/next-draft").json()
+    assert res["clip_id"] == "demo:give_pen"
+    assert res["remaining"] == 1
+
+    # After verifying, no drafts remain.
+    client.post(
+        "/api/scenes/demo:give_pen",
+        json={"annotator": "alice", "review_status": "verified"},
+    )
+    res = client.get("/api/next-draft").json()
+    assert res["clip_id"] is None
+    assert res["remaining"] == 0
+
+
+def test_video_endpoint_returns_404_when_no_videos_root(client: TestClient):
+    head = client.head("/video/video_A")
+    assert head.status_code == 404

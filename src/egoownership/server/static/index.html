@@ -8,16 +8,34 @@
 </head>
 <body>
 <header>
-  <h1>Egocentric Implicit Ownership · Annotator</h1>
+  <div class="brand">
+    <h1>Ego-Ownership</h1>
+    <span class="subtitle">implicit ownership benchmark · annotator</span>
+  </div>
+  <div class="progress-block">
+    <div class="progress-row">
+      <span id="progress-text">loading…</span>
+      <span class="kbd-hint" id="kbd-hint" title="keyboard shortcuts">?</span>
+    </div>
+    <div class="progress-bar"><div id="progress-fill"></div></div>
+  </div>
   <div class="who">
-    annotator:
-    <input id="annotator" type="text" placeholder="your name" />
-    <span class="stats" id="stats"></span>
+    <label class="annotator-label">
+      <span>annotator</span>
+      <input id="annotator" type="text" placeholder="your name" />
+    </label>
+    <label class="auto-advance">
+      <input id="auto-advance" type="checkbox" checked />
+      <span>auto-advance</span>
+    </label>
   </div>
 </header>
 
 <main>
   <aside id="sidebar">
+    <div class="sidebar-header">
+      <input id="search" type="search" placeholder="search clip_id / verb / noun…" />
+    </div>
     <div class="filters">
       <label>status
         <select id="filter-status">
@@ -46,32 +64,88 @@
           <option value="AMBIGUOUS">AMBIGUOUS</option>
         </select>
       </label>
-      <button id="refresh">refresh</button>
+      <label>sort
+        <select id="filter-sort">
+          <option value="default">order in file</option>
+          <option value="confidence-asc" selected>low confidence first</option>
+          <option value="confidence-desc">high confidence first</option>
+        </select>
+      </label>
     </div>
     <ol id="scene-list"></ol>
   </aside>
 
   <section id="workspace">
-    <div id="empty-state">Select a scene from the sidebar to begin reviewing.</div>
+    <div id="empty-state">
+      <h2>Ready to label</h2>
+      <p>Pick a scene from the sidebar — or press <kbd>N</kbd> to start with the
+      lowest-confidence clip.</p>
+    </div>
+
     <div id="scene-detail" hidden>
       <div class="meta-row">
         <h2 id="clip-id"></h2>
         <span class="badge" id="dataset-badge"></span>
-        <span class="badge" id="taxonomy-badge"></span>
-        <span class="badge" id="status-badge"></span>
-        <span class="badge" id="conf-badge"></span>
+        <span class="badge tax-badge" id="taxonomy-badge"></span>
+        <span class="badge status-badge" id="status-badge"></span>
+        <span class="badge conf-badge" id="conf-badge"></span>
+        <span class="badge dirty-badge" id="dirty-badge" hidden>unsaved</span>
+        <span class="last-saved" id="last-saved"></span>
+      </div>
+      <div class="meta-row sub">
+        <span id="verb-noun"></span>
+        <span class="dot">·</span>
+        <span id="auto-label-display"></span>
       </div>
       <p class="narration" id="narration"></p>
 
+      <div id="video-block" class="video-block" hidden>
+        <video id="clip-video" controls preload="metadata"></video>
+        <div class="video-controls">
+          <button data-jump="t-2">↤ t-2</button>
+          <button data-jump="t-1">⇶ t-1</button>
+          <button data-jump="t">↦ t</button>
+          <span id="video-time"></span>
+        </div>
+      </div>
+
+      <div class="frames-toolbar">
+        <label class="toggle">
+          <input id="show-zones" type="checkbox" />
+          <span>show zones</span>
+        </label>
+        <label class="toggle">
+          <input id="show-relations" type="checkbox" />
+          <span>show relations</span>
+        </label>
+        <label class="toggle">
+          <input id="show-persons" type="checkbox" checked />
+          <span>show persons</span>
+        </label>
+      </div>
+
       <div class="frames-grid" id="frames-grid"></div>
+
+      <div class="actions">
+        <button class="quick-approve" id="quick-approve" title="V">
+          <span class="icon">✓</span>
+          <span class="label">Auto-label is correct</span>
+          <span class="hint">verify &amp; advance · V</span>
+        </button>
+        <button class="quick-reject" id="quick-reject" title="X">
+          <span class="icon">✕</span>
+          <span class="label">Reject this clip</span>
+          <span class="hint">X</span>
+        </button>
+      </div>
 
       <div class="controls">
         <fieldset>
-          <legend>Scene label</legend>
+          <legend>Scene label <small class="hint">1 2 3 4</small></legend>
           <div id="scene-label-buttons"></div>
         </fieldset>
         <fieldset>
-          <legend>Taxonomy</legend>
+          <legend>Taxonomy <small class="hint">A B C D</small></legend>
           <div id="taxonomy-buttons"></div>
         </fieldset>
         <fieldset>
@@ -80,20 +154,17 @@
         </fieldset>
         <fieldset class="full">
           <legend>Notes</legend>
-          <textarea id="notes" rows="2" placeholder="reasoning, edge-case calls…"></textarea>
+          <textarea id="notes" rows="2" placeholder="why this label / edge cases…"></textarea>
         </fieldset>
-        <button id="save" class="primary">save</button>
+        <button id="save" class="primary"><span>save</span><span class="hint">⌘S</span></button>
+        <button id="prev" class="ghost" title="K"><span>↑ prev</span></button>
+        <button id="next" class="ghost" title="J or N"><span>next ↓</span></button>
         <span id="save-feedback"></span>
       </div>
 
-      <details class="objects-detail">
-        <summary>Per-object detections (<span id="n-objects">0</span>)</summary>
-        <table id="objects-table">
-          <thead>
-            <tr><th>frame</th><th>id</th><th>class</th><th>score</th><th>auto-label</th><th>override</th><th>evidence</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <details class="instances-detail" open>
+        <summary>Per-instance review (<span id="n-instances">0</span>)</summary>
+        <div id="instances-grid"></div>
       </details>
 
       <details class="relations-detail">
@@ -109,10 +180,57 @@
   </section>
 
   <aside id="activity">
-    <h3>Recent activity</h3>
-    <ul id="activity-list"></ul>
+    <div class="activity-tabs">
+      <button class="tab-btn active" data-tab="activity">activity</button>
+      <button class="tab-btn" data-tab="stats">stats</button>
+    </div>
+    <div id="activity-pane" class="tab-pane active">
+      <ul id="activity-list"></ul>
+    </div>
+    <div id="stats-pane" class="tab-pane">
+      <div class="stats-block">
+        <h4>by status</h4>
+        <div id="stats-status"></div>
+        <h4>by label</h4>
+        <div id="stats-label"></div>
+        <h4>by taxonomy</h4>
+        <div id="stats-taxonomy"></div>
+      </div>
+    </div>
   </aside>
 </main>
+
+<dialog id="zoom-modal">
+  <div class="zoom-header">
+    <span id="zoom-title"></span>
+    <button id="zoom-close">close · esc</button>
+  </div>
+  <div class="zoom-canvas-wrap"><canvas id="zoom-canvas"></canvas></div>
+</dialog>
+
+<dialog id="help-modal">
+  <h3>Keyboard shortcuts</h3>
+  <table>
+    <tr><th colspan="2">Labeling</th></tr>
+    <tr><td><kbd>1</kbd></td><td>set scene label · MINE</td></tr>
+    <tr><td><kbd>2</kbd></td><td>set scene label · PERSON_k</td></tr>
+    <tr><td><kbd>3</kbd></td><td>set scene label · SHARED</td></tr>
+    <tr><td><kbd>4</kbd></td><td>set scene label · AMBIGUOUS</td></tr>
+    <tr><td><kbd>A</kbd>/<kbd>B</kbd>/<kbd>C</kbd>/<kbd>D</kbd></td><td>set taxonomy</td></tr>
+    <tr><th colspan="2">Workflow</th></tr>
+    <tr><td><kbd>V</kbd></td><td>quick approve · auto-label is correct, mark verified, advance</td></tr>
+    <tr><td><kbd>X</kbd></td><td>reject this clip and advance</td></tr>
+    <tr><td><kbd>⌘ / Ctrl + S</kbd></td><td>save current edits</td></tr>
+    <tr><td><kbd>J</kbd> / <kbd>N</kbd></td><td>next scene needing review</td></tr>
+    <tr><td><kbd>K</kbd></td><td>previous scene</td></tr>
+    <tr><td><kbd>Z</kbd></td><td>toggle zone overlays</td></tr>
+    <tr><td><kbd>R</kbd></td><td>toggle relation overlays</td></tr>
+    <tr><td><kbd>F</kbd></td><td>focus search</td></tr>
+    <tr><td><kbd>?</kbd></td><td>this help</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>close dialog / blur input</td></tr>
+  </table>
+  <button id="help-close">close</button>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>

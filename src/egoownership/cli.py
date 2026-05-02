@@ -106,16 +106,49 @@ def extract_frames_cmd(
 @app.command("detect")
 def detect_cmd(
     candidates: Path = typer.Option(..., help="JSONL from the filter stage"),
-    frames: Path = typer.Option(..., help="Directory produced by extract-frames"),
+    frames: Path = typer.Option(None, help="Directory produced by extract-frames (model path)"),
     out: Path = typer.Option(..., help="Output JSONL path for detections"),
-    use_sam: bool = typer.Option(False, help="Run SAM2 mask refinement on boxes"),
-    use_ram: bool = typer.Option(False, help="Bottom-up RAM tag extraction → augment DINO prompt"),
-    detect_persons: bool = typer.Option(True, help="Run a person-only DINO pass and dynamic zones"),
-    extract_attrs: bool = typer.Option(False, help="VLM-based per-object attribute extraction"),
-    estimate_depth: bool = typer.Option(False, help="Run Depth Anything v2 to enable depth-aware zones"),
-    use_sam2_video: bool = typer.Option(False, help="Use SAM2 video predictor for tracking"),
+    source: str = typer.Option(
+        "model",
+        help="'model' (run DINO/SAM/etc) or 'native' (use dataset-supplied bboxes — no GPU needed)",
+    ),
+    annotations: Path = typer.Option(
+        None,
+        help="Annotation file (required when --source=native, e.g. fho_main.json)",
+    ),
+    dataset: str = typer.Option(
+        None,
+        help="Dataset name when --source=native (ego4d-fho or hd-epic)",
+    ),
+    use_sam: bool = typer.Option(False, help="[model] SAM2 mask refinement"),
+    use_ram: bool = typer.Option(False, help="[model] Bottom-up RAM tagging → augment DINO prompt"),
+    detect_persons: bool = typer.Option(True, help="[model] Person-only DINO pass + dynamic zones"),
+    extract_attrs: bool = typer.Option(False, help="[model] VLM attribute extraction"),
+    estimate_depth: bool = typer.Option(False, help="[model] Depth Anything v2 → depth-aware zones"),
+    use_sam2_video: bool = typer.Option(False, help="[model] SAM2 video predictor for tracking"),
+    remote_vlm: str = typer.Option(
+        None,
+        help="[model] Replace local RAM/BLIP-2 with a remote VLM provider: 'anthropic' or 'openai'",
+    ),
 ):
-    """Run DINO (+ optional RAM/SAM/depth/VLM) and emit per-frame detections."""
+    """Run DINO (+ optional extras) OR pull dataset-native bboxes — choose with --source."""
+    if source == "native":
+        if annotations is None or dataset is None:
+            raise typer.BadParameter("--annotations and --dataset are required for --source=native")
+        n = pipeline.stage_detect_native(
+            candidates_path=candidates,
+            annotations_path=annotations,
+            dataset=dataset,
+            out_path=out,
+        )
+        _CONSOLE.print(f"[green]Native bbox detect: {n} clips[/green] → {out}")
+        return
+
+    if source != "model":
+        raise typer.BadParameter(f"--source must be 'model' or 'native', got {source!r}")
+    if frames is None:
+        raise typer.BadParameter("--frames is required when --source=model")
+
     n = pipeline.stage_detect(
         candidates,
         frames,
@@ -126,6 +159,7 @@ def detect_cmd(
         extract_attrs=extract_attrs,
         estimate_depth=estimate_depth,
         use_sam2_video=use_sam2_video,
+        remote_vlm_provider=remote_vlm,
     )
     _CONSOLE.print(f"[green]Detected on {n} clips[/green] → {out}")
 
@@ -137,9 +171,22 @@ def detect_cmd(
 def label_cmd(
     detections: Path = typer.Option(..., help="JSONL from the detect stage"),
     out: Path = typer.Option(..., help="Output JSONL for final scene records"),
+    remote_vlm_judge: str = typer.Option(
+        None,
+        help="Get a second-opinion ownership label from 'anthropic' or 'openai'",
+    ),
+    frames_root: Path = typer.Option(
+        None,
+        help="Required when --remote-vlm-judge is set — root dir for frame_path lookups",
+    ),
 ):
-    """Apply the bbox-position heuristic and emit final SceneRecords."""
-    n = pipeline.stage_label(detections, out)
+    """Apply the rule cascade (+ optional VLM second opinion) and emit SceneRecords."""
+    n = pipeline.stage_label(
+        detections,
+        out,
+        remote_vlm_judge=remote_vlm_judge,
+        frames_root=frames_root,
+    )
     _CONSOLE.print(f"[green]Labeled {n} scenes[/green] → {out}")
 
 
@@ -150,6 +197,9 @@ def label_cmd(
 def serve_cmd(
     scenes: Path = typer.Option(..., help="Path to scene_records.jsonl"),
     frames_root: Path = typer.Option(..., help="Root directory frame paths are relative to"),
+    videos_root: Path = typer.Option(
+        None, help="Optional: directory with {video_id}.mp4 files for clip playback"
+    ),
     host: str = typer.Option("0.0.0.0", help="Bind address (use 0.0.0.0 for LAN sharing)"),
     port: int = typer.Option(8000, help="Port"),
     reload: bool = typer.Option(False, help="Auto-reload on code changes (dev only)"),
@@ -158,16 +208,22 @@ def serve_cmd(
 
     Open http://HOST:PORT in a browser. Multiple annotators can connect at the
     same time; edits are written through to ``scenes`` JSONL with file-locking.
+    Pass ``--videos-root`` to enable inline clip playback in the UI.
     """
     import uvicorn
     from egoownership.server import create_app
 
-    fastapi_app = create_app(scenes_path=scenes, frames_root=frames_root)
+    fastapi_app = create_app(
+        scenes_path=scenes,
+        frames_root=frames_root,
+        videos_root=videos_root,
+    )
     if reload:
-        # Reload-mode requires an import string; we provide a helper module path.
         import os
         os.environ["EGOOWN_SCENES_PATH"] = str(scenes)
         os.environ["EGOOWN_FRAMES_ROOT"] = str(frames_root)
+        if videos_root is not None:
+            os.environ["EGOOWN_VIDEOS_ROOT"] = str(videos_root)
         uvicorn.run("egoownership.server.entry:app", host=host, port=port, reload=True)
     else:
         uvicorn.run(fastapi_app, host=host, port=port)

@@ -13,4 +13,9 @@ from egoownership.server.app import create_app
 
 _scenes = os.environ.get("EGOOWN_SCENES_PATH", "outputs/scene_records.jsonl")
 _frames = os.environ.get("EGOOWN_FRAMES_ROOT", "frames")
-app = create_app(Path(_scenes), Path(_frames))
+_videos = os.environ.get("EGOOWN_VIDEOS_ROOT")
+app = create_app(
+    Path(_scenes),
+    Path(_frames),
+    videos_root=Path(_videos) if _videos else None,
+)
