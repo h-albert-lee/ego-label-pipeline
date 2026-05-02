@@ -1,0 +1,5 @@
+narration_id,participant_id,video_id,narration_timestamp,start_timestamp,stop_timestamp,start_frame,stop_frame,narration,verb,verb_class,noun,noun_class,all_nouns,all_noun_classes
+P11_01_001,P11,P11_01,00:02:00.00,00:02:00.00,00:02:02.00,3600,3720,put the cup on the table,put,3,cup,42,"['cup']","[42]"
+P13_05_002,P13,P13_05,00:00:45.00,00:00:45.00,00:00:46.50,1350,1395,take the fork,take,10,fork,50,"['fork']","[50]"
+P13_05_003,P13,P13_05,00:01:00.00,00:01:00.00,00:01:02.00,1800,1860,turn on oven,turn-on,18,oven,99,"['oven']","[99]"
+P11_01_004,P11,P11_01,00:03:00.00,00:03:00.00,00:03:01.50,5400,5445,hand over the plate,hand,4,plate,41,"['plate']","[41]"

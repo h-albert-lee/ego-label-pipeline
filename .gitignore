@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Data (do not commit dataset annotations or video files)
+data/
+raw/
+processed/
+outputs/
+frames/
+frames_demo/
+*.mp4
+*.mkv
+*.webm
+
+# Annotations and big JSON (anchored to repo root to avoid eating fixtures)
+*.parquet
+/fho_main.json
+/data/EPIC_*.csv
+/data/EPIC_*.pkl
+
+# Model weights / caches
+*.pt
+*.bin
+*.safetensors
+.cache/
+hf_cache/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/

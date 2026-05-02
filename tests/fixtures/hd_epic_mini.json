@@ -1,0 +1,20 @@
+{
+  "video_id": "P01_03",
+  "fps": 60.0,
+  "tracks": [
+    {
+      "track_id": 15,
+      "object": "notebook",
+      "movement_type": "transfer",
+      "start_frame": 13200,
+      "end_frame": 13800
+    },
+    {
+      "track_id": 22,
+      "object": "sponge",
+      "movement_type": "wipe",
+      "start_frame": 20000,
+      "end_frame": 20400
+    }
+  ]
+}

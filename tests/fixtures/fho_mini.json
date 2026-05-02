@@ -1,0 +1,46 @@
+{
+  "clips": [
+    {
+      "clip_uid": "clip_dining_001",
+      "video_uid": "video_A",
+      "annotations": [
+        {
+          "unique_id": "ann_1",
+          "verb": "put_down",
+          "narration_text": "Put down the cup on the table",
+          "objects": [{"object_type": "cup"}],
+          "pre_frame":  {"time": 10.0},
+          "pnr_frame":  {"time": 10.4},
+          "post_frame": {"time": 10.8}
+        },
+        {
+          "unique_id": "ann_2",
+          "verb": "give",
+          "narration_text": "Give the pen to the other person",
+          "objects": [{"object_type": "pen"}],
+          "pre_frame":  {"time": 20.0},
+          "pnr_frame":  {"time": 20.5},
+          "post_frame": {"time": 21.0}
+        },
+        {
+          "unique_id": "ann_3",
+          "verb": "turn_on",
+          "narration_text": "Turn on the oven",
+          "objects": [{"object_type": "oven"}],
+          "pre_frame":  {"time": 30.0},
+          "pnr_frame":  {"time": 30.2},
+          "post_frame": {"time": 30.4}
+        },
+        {
+          "unique_id": "ann_4",
+          "verb": "pass",
+          "narration_text": "Pass the bread basket",
+          "objects": [{"object_type": "basket"}, {"object_type": "bread"}],
+          "pre_frame":  {"time": 40.0},
+          "pnr_frame":  {"time": 40.5},
+          "post_frame": {"time": 41.0}
+        }
+      ]
+    }
+  ]
+}

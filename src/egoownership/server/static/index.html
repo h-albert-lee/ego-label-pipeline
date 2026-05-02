@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ego-Ownership Annotator</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<header>
+  <h1>Egocentric Implicit Ownership · Annotator</h1>
+  <div class="who">
+    annotator:
+    <input id="annotator" type="text" placeholder="your name" />
+    <span class="stats" id="stats"></span>
+  </div>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <div class="filters">
+      <label>status
+        <select id="filter-status">
+          <option value="">all</option>
+          <option value="draft">draft</option>
+          <option value="in_review">in_review</option>
+          <option value="verified">verified</option>
+          <option value="rejected">rejected</option>
+        </select>
+      </label>
+      <label>taxonomy
+        <select id="filter-taxonomy">
+          <option value="">all</option>
+          <option value="A">A · Baseline</option>
+          <option value="B">B · Conflict</option>
+          <option value="C">C · Contextual</option>
+          <option value="D">D · Ambiguous</option>
+        </select>
+      </label>
+      <label>label
+        <select id="filter-label">
+          <option value="">all</option>
+          <option value="MINE">MINE</option>
+          <option value="PERSON_k">PERSON_k</option>
+          <option value="SHARED">SHARED</option>
+          <option value="AMBIGUOUS">AMBIGUOUS</option>
+        </select>
+      </label>
+      <button id="refresh">refresh</button>
+    </div>
+    <ol id="scene-list"></ol>
+  </aside>
+
+  <section id="workspace">
+    <div id="empty-state">Select a scene from the sidebar to begin reviewing.</div>
+    <div id="scene-detail" hidden>
+      <div class="meta-row">
+        <h2 id="clip-id"></h2>
+        <span class="badge" id="dataset-badge"></span>
+        <span class="badge" id="taxonomy-badge"></span>
+        <span class="badge" id="status-badge"></span>
+        <span class="badge" id="conf-badge"></span>
+      </div>
+      <p class="narration" id="narration"></p>
+
+      <div class="frames-grid" id="frames-grid"></div>
+
+      <div class="controls">
+        <fieldset>
+          <legend>Scene label</legend>
+          <div id="scene-label-buttons"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Taxonomy</legend>
+          <div id="taxonomy-buttons"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Status</legend>
+          <div id="status-buttons"></div>
+        </fieldset>
+        <fieldset class="full">
+          <legend>Notes</legend>
+          <textarea id="notes" rows="2" placeholder="reasoning, edge-case calls…"></textarea>
+        </fieldset>
+        <button id="save" class="primary">save</button>
+        <span id="save-feedback"></span>
+      </div>
+
+      <details class="objects-detail">
+        <summary>Per-object detections (<span id="n-objects">0</span>)</summary>
+        <table id="objects-table">
+          <thead>
+            <tr><th>frame</th><th>id</th><th>class</th><th>score</th><th>auto-label</th><th>override</th><th>evidence</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </details>
+
+      <details class="relations-detail">
+        <summary>Scene graph relations (<span id="n-relations">0</span>)</summary>
+        <ul id="relations-list"></ul>
+      </details>
+
+      <details class="edits-detail">
+        <summary>Edit history (<span id="n-edits">0</span>)</summary>
+        <ul id="edits-list"></ul>
+      </details>
+    </div>
+  </section>
+
+  <aside id="activity">
+    <h3>Recent activity</h3>
+    <ul id="activity-list"></ul>
+  </aside>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

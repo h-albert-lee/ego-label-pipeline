@@ -1,0 +1,76 @@
+# Verb / noun whitelists used for metadata filtering.
+# Extend freely — these are the starting ruleset described in the EDA.
+
+label_space: [MINE, PERSON_k, SHARED, AMBIGUOUS]
+
+# Verbs that indicate an ownership transition (Contextual / Taxonomy C).
+contextual_verbs:
+  - give
+  - pass
+  - hand
+  - hand_over
+  - handover
+  - put
+  - put_down
+  - place
+  - drop
+  - take
+  - receive
+  - push
+  - slide
+  - offer
+  # HD-EPIC movement_type labels (§3.1 of the EDA): "put", "place", "transfer"
+  - transfer
+  - pickup
+
+# Verbs that hint at Baseline (static) scenes — presence of these usually
+# means the object is at rest on a surface.
+baseline_verbs:
+  - set
+  - arrange
+  - hold
+
+# Nouns indicating dining / meeting shared-table scenes.
+shared_table_nouns:
+  - cup
+  - mug
+  - bottle
+  - glass
+  - bowl
+  - plate
+  - dish
+  - fork
+  - spoon
+  - knife
+  - chopstick
+  - pen
+  - pencil
+  - notebook
+  - notepad
+  - laptop
+  - phone
+  - mobile
+  - document
+  - paper
+  - folder
+  - bread
+  - basket
+  - salt
+  - pepper
+  - spice
+  - sauce
+  - napkin
+
+# Heuristic zone thresholds in normalized image coords (0..1) used by
+# detection/ownership.py to assign MINE / SHARED / PERSON_k to a bbox.
+ownership_zones:
+  # Camera wearer's "near" zone: bbox center_y must be >= this.
+  mine_near_y_min: 0.55
+  # Central "shared" zone (horizontal band): bbox center_x in [min, max].
+  shared_x_min: 0.30
+  shared_x_max: 0.70
+  # Other-person zone: bbox center_y <= this AND outside shared_x band.
+  person_far_y_max: 0.55
+  # Fraction of bbox area to image area below which we call AMBIGUOUS
+  # (object too far / too small to confidently attribute).
+  min_bbox_area_ratio: 0.003
