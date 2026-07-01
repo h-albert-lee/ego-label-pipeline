@@ -595,14 +595,13 @@ def caption_bboxes_cmd(
         "--captioner-backend/--caption-model-path/--caption-device.",
     ),
     captioner_backend: str = typer.Option(
-        "internvl",
-        help="internvl: CAT-V's stock InternVL2_5-8B-MPO flow. qwen3vl: caption via Qwen3-VL instead "
-        "(scripts/run_qwen_vl_caption.py, runs under the sam2hf env). Ignored if --catv-command-template is set.",
+        "qwen3vl",
+        help="qwen3vl (default): caption via Qwen3-VL (scripts/run_catv_one_object.py, runs under the sam2hf env). "
+        "Ignored if --catv-command-template is set.",
     ),
     caption_model_path: str = typer.Option(
         None,
-        help="Override the captioning model id. Defaults: OpenGVLab/InternVL2_5-8B-MPO (internvl) or "
-        "Qwen/Qwen3-VL-8B-Instruct (qwen3vl).",
+        help="Override the captioning model id. Default: Qwen/Qwen3-VL-8B-Instruct.",
     ),
     caption_device: str = typer.Option("cuda:0", help="Device for the captioning model"),
     caption_fps: float = typer.Option(
@@ -614,9 +613,7 @@ def caption_bboxes_cmd(
     caption_max_frames: int = typer.Option(
         16,
         help="Hard cap on frames sent to the captioning model per object, after sampling at "
-        "--caption-fps across the whole clip. Keep at 16 for the internvl backend (its context "
-        "window is 8192 tokens and this env lacks FlashAttention2, so more frames risks an OOM/"
-        "context-overflow crash); qwen3vl can typically tolerate more.",
+        "--caption-fps across the whole clip.",
     ),
     catv_work_dir: Path = typer.Option(
         Path("outputs/catv_work"),
@@ -656,27 +653,22 @@ def caption_bboxes_cmd(
     )
 
     if catv_command_template is None:
-        if captioner_backend not in {"internvl", "qwen3vl"}:
-            raise typer.BadParameter("--captioner-backend must be 'internvl' or 'qwen3vl'")
-        base_template = (
+        if captioner_backend != "qwen3vl":
+            raise typer.BadParameter("--captioner-backend must be 'qwen3vl'")
+        model_path = caption_model_path or "Qwen/Qwen3-VL-8B-Instruct"
+        catv_command_template = (
             "/home/jhlee/miniconda3/envs/test/bin/python "
             "/home/jhlee/ego-label-pipeline/scripts/run_catv_one_object.py "
             "--video {video_path} --first-frame {first_frame_path} "
             "--bbox {bbox_path} --out {output_json} "
-            f"--catv-root /home/jhlee/CAT-V --catv-device {caption_device} "
+            f"--catv-device {caption_device} "
             f"--start-sec {{start_sec}} --fps {caption_fps:g} --whole-video "
             f"--max-frames-num {caption_max_frames} "
+            "--captioner-backend qwen3vl "
+            "--qwen-vl-python /home/jhlee/miniconda3/envs/sam2hf/bin/python "
+            f"--model-path {model_path} "
+            "--caption {object_nouns}"
         )
-        if captioner_backend == "qwen3vl":
-            model_path = caption_model_path or "Qwen/Qwen3-VL-8B-Instruct"
-            base_template += (
-                "--captioner-backend qwen3vl "
-                "--qwen-vl-python /home/jhlee/miniconda3/envs/sam2hf/bin/python "
-                f"--model-path {model_path} "
-            )
-        elif caption_model_path:
-            base_template += f"--model-path {caption_model_path} "
-        catv_command_template = base_template + "--caption {object_nouns}"
 
     captioner = CatVCommandCaptioner(
         command_template=catv_command_template,
@@ -701,7 +693,7 @@ def caption_bboxes_cmd(
 def caption_bboxes_batch_cmd(
     input_jsonl: Path = typer.Option(..., "--input", help="BBox JSONL produced by extract-bboxes"),
     out: Path = typer.Option(..., help="Output JSONL with object captions"),
-    captioner_backend: str = typer.Option("qwen3vl", help="qwen3vl (default) or internvl"),
+    captioner_backend: str = typer.Option("qwen3vl", help="Captioner backend (only qwen3vl is supported)"),
     caption_model_path: str = typer.Option(
         "Qwen/Qwen3-VL-8B-Instruct",
         help="Captioning model id or local path",
@@ -710,10 +702,9 @@ def caption_bboxes_batch_cmd(
     caption_fps: float = typer.Option(1.0, help="Frames/sec extracted from each clip"),
     caption_max_frames: int = typer.Option(16, help="Max frames sent to the VLM per object"),
     caption_max_side: int = typer.Option(448, help="Resize each frame's longer side to this many pixels"),
-    catv_root: Path = typer.Option(Path("/home/jhlee/CAT-V"), help="CAT-V repo root"),
     mask_model_path: Path = typer.Option(
-        None,
-        help="SAM-2 checkpoint (.pt). Defaults to <catv-root>/checkpoints/sam2.1_hiera_base_plus.pt",
+        ...,
+        help="SAM-2 checkpoint (.pt file), e.g. checkpoints/sam2.1_hiera_base_plus.pt",
     ),
     catv_python: str = typer.Option(
         None,
@@ -748,7 +739,6 @@ def caption_bboxes_batch_cmd(
     n = write_catv_captions_batch(
         input_jsonl,
         out,
-        catv_root=catv_root,
         mask_model_path=mask_model_path,
         catv_device=caption_device,
         fps=caption_fps,

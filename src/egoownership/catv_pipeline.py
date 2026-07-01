@@ -437,8 +437,7 @@ def write_catv_captions_batch(
     input_path: Path,
     out_path: Path,
     *,
-    catv_root: Path = Path("/home/jhlee/CAT-V"),
-    mask_model_path: Path | None = None,
+    mask_model_path: Path,
     catv_device: str = "cuda:0",
     fps: float = 1.0,
     whole_video: bool = True,
@@ -485,7 +484,6 @@ def write_catv_captions_batch(
             input_path=input_path,
             out_path=out_path,
             work_root=work_root,
-            catv_root=catv_root,
             mask_model_path=mask_model_path,
             catv_device=catv_device,
             fps=fps,
@@ -509,8 +507,7 @@ def _write_catv_captions_batch_in_workdir(
     input_path: Path,
     out_path: Path,
     work_root: Path,
-    catv_root: Path,
-    mask_model_path: Path | None,
+    mask_model_path: Path,
     catv_device: str,
     fps: float,
     whole_video: bool,
@@ -630,15 +627,13 @@ def _write_catv_captions_batch_in_workdir(
     # --- Phase 2: Run SAM-2 batch tracker ---
     print(f"[batch_captioning] Phase 2: SAM-2 tracking ({len(sam2_jobs)} jobs) …", flush=True)
     catv_py = catv_python or sys.executable
-    mask_model = str(mask_model_path) if mask_model_path else str(catv_root / "checkpoints" / "sam2.1_hiera_base_plus.pt")
     batch_sam2_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_sam2_mask.py"
     _run_batch_subprocess(
         [
             catv_py,
             str(batch_sam2_script),
             "--jobs", str(sam2_jobs_path),
-            "--catv-root", str(catv_root),
-            "--model-path", mask_model,
+            "--model-path", str(mask_model_path),
             "--device", catv_device,
         ],
         label="batch_sam2_mask",

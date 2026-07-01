@@ -6,7 +6,7 @@ mask propagation for every job without reloading the model. Compared to spawning
 run_catv_one_object.py per-row, this eliminates the ~30s SAM-2 model-load
 overhead that was previously paid for every object.
 
-Runs in the CAT-V 'test' conda env (same env as run_catv_one_object.py).
+Requires the `sam2` package to be pip-installed (`pip install sam2`).
 
 Job JSONL format (one JSON object per line):
   {
@@ -204,15 +204,11 @@ def _process_one_job(predictor, job: dict, *, device: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Batch SAM-2 bidirectional tracking (model loaded once)")
     parser.add_argument("--jobs", required=True, type=Path, help="JSONL of SAM-2 masking jobs")
-    parser.add_argument("--catv-root", type=Path, default=Path("/home/jhlee/CAT-V"))
-    parser.add_argument("--model-path", default=None, help="Path to sam2.1_hiera_*.pt checkpoint")
+    parser.add_argument("--model-path", required=True, help="Path to sam2.1_hiera_*.pt checkpoint")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
-    catv_root = args.catv_root.resolve()
-    sys.path.insert(0, str(catv_root))
-
-    model_path = args.model_path or str(catv_root / "checkpoints" / "sam2.1_hiera_base_plus.pt")
+    model_path = args.model_path
     if not Path(model_path).exists():
         raise FileNotFoundError(f"SAM-2 checkpoint not found: {model_path}")
 
