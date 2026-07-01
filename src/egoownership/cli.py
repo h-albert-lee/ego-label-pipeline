@@ -481,27 +481,26 @@ def extract_bboxes_cmd(
         "Required for egolife and generic. "
         "For ego4d, defaults to --scratch-root (and videos are auto-downloaded if missing).",
     ),
-    out: Path = typer.Option(..., help="Output bbox JSONL for CAT-V captioning"),
+    out: Path = typer.Option(
+        None,
+        help="Output bbox JSONL. Defaults to outputs/{dataset}/bbox_objects.jsonl",
+    ),
     frames_dir: Path = typer.Option(
-        Path("outputs/catv_first_frames_objectlist"),
-        help="Cache directory for sampled frames and bbox visualizations",
+        None,
+        help="Cache directory for sampled frames and bbox visualizations. Defaults to outputs/{dataset}/catv_first_frames",
     ),
     object_nouns: Path = typer.Option(
         None,
-        help="Optional JSONL allowlist of object nouns (filters spaCy/caption noun candidates)",
+        help="JSONL allowlist of object nouns. Defaults to data/{dataset}/{dataset}_table_caption_object_nouns.jsonl if it exists.",
     ),
     ego4d_clip_sec: float = typer.Option(
         30.0,
         help="[Ego4D] Clip length in seconds, centered on each narration timestamp",
     ),
-    scratch_root: Path = typer.Option(
-        None,
-        help="[Ego4D] Scratch directory for downloads and cached 30s subclips",
-    ),
     auto_download: bool = typer.Option(
         True,
         "--auto-download/--no-auto-download",
-        help="[Ego4D] Download missing full-scale videos into scratch via ego4d CLI",
+        help="[Ego4D] Download missing full-scale videos into --videos-root via ego4d CLI",
     ),
     require_observer: bool = typer.Option(
         True,
@@ -537,13 +536,19 @@ def extract_bboxes_cmd(
     """Extract target-object boxes before CAT-V captioning (multi-dataset)."""
     from egoownership.catv_datasets import normalize_dataset_id
     from egoownership.catv_pipeline import write_caption_bboxes
-    from egoownership.ego4d_video import default_scratch_root
     from egoownership.sam2_objects import Sam2ObjectConfig, Sam2ObjectExtractor
 
     ds = normalize_dataset_id(dataset)
+    out_dir = Path("outputs") / ds
+    resolved_out = out or (out_dir / "bbox_objects.jsonl")
+    resolved_frames_dir = frames_dir or (out_dir / "catv_first_frames")
+
+    _data_dir = Path(__file__).resolve().parent.parent.parent / "data"
+    _default_nouns = _data_dir / ds / f"{ds}_table_caption_object_nouns.jsonl"
+    resolved_object_nouns = object_nouns or (_default_nouns if _default_nouns.exists() else None)
+
     if ds == "ego4d_fho":
-        resolved_scratch = scratch_root or default_scratch_root()
-        resolved_videos_root = videos_root or resolved_scratch
+        resolved_videos_root = videos_root or Path("data/ego4d/videos")
     elif videos_root is None:
         raise typer.BadParameter(f"--videos-root is required for --dataset {dataset}")
     else:
@@ -563,22 +568,21 @@ def extract_bboxes_cmd(
     n = write_caption_bboxes(
         input_jsonl,
         resolved_videos_root,
-        out,
+        resolved_out,
         dataset=dataset,
         extractor=extractor,
-        frames_dir=frames_dir,
-        object_nouns_path=object_nouns,
+        frames_dir=resolved_frames_dir,
+        object_nouns_path=resolved_object_nouns,
         max_objects_per_record=max_objects_per_caption,
         reference_frame=reference_frame,
         limit=limit if limit > 0 else None,
         resume=resume,
         show_progress=progress,
         ego4d_clip_window_sec=ego4d_clip_sec if ds == "ego4d_fho" else None,
-        ego4d_scratch_root=resolved_scratch if ds == "ego4d_fho" else None,
         ego4d_auto_download=auto_download if ds == "ego4d_fho" else False,
         ego4d_require_observer=require_observer if ds == "ego4d_fho" else True,
     )
-    _CONSOLE.print(f"[green]Wrote {n} {dataset} bbox rows[/green] → {out}")
+    _CONSOLE.print(f"[green]Wrote {n} {dataset} bbox rows[/green] → {resolved_out}")
 
 
 @app.command("caption-bboxes")
@@ -655,17 +659,17 @@ def caption_bboxes_cmd(
     if catv_command_template is None:
         if captioner_backend != "qwen3vl":
             raise typer.BadParameter("--captioner-backend must be 'qwen3vl'")
+        import sys as _sys
         model_path = caption_model_path or "Qwen/Qwen3-VL-8B-Instruct"
+        script_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "run_catv_one_object.py"
         catv_command_template = (
-            "/home/jhlee/miniconda3/envs/test/bin/python "
-            "/home/jhlee/ego-label-pipeline/scripts/run_catv_one_object.py "
+            f"{_sys.executable} {script_path} "
             "--video {video_path} --first-frame {first_frame_path} "
             "--bbox {bbox_path} --out {output_json} "
             f"--catv-device {caption_device} "
             f"--start-sec {{start_sec}} --fps {caption_fps:g} --whole-video "
             f"--max-frames-num {caption_max_frames} "
-            "--captioner-backend qwen3vl "
-            "--qwen-vl-python /home/jhlee/miniconda3/envs/sam2hf/bin/python "
+            f"--captioner-backend qwen3vl "
             f"--model-path {model_path} "
             "--caption {object_nouns}"
         )
@@ -692,7 +696,14 @@ def caption_bboxes_cmd(
 @app.command("caption-bboxes-batch")
 def caption_bboxes_batch_cmd(
     input_jsonl: Path = typer.Option(..., "--input", help="BBox JSONL produced by extract-bboxes"),
-    out: Path = typer.Option(..., help="Output JSONL with object captions"),
+    out: Path = typer.Option(
+        None,
+        help="Output JSONL with object captions. Defaults to outputs/{dataset}/captions.jsonl",
+    ),
+    dataset: str = typer.Option(
+        None,
+        help="Dataset name (egolife, ego4d, ...) used to derive default output path",
+    ),
     captioner_backend: str = typer.Option("qwen3vl", help="Captioner backend (only qwen3vl is supported)"),
     caption_model_path: str = typer.Option(
         "Qwen/Qwen3-VL-8B-Instruct",
@@ -702,18 +713,17 @@ def caption_bboxes_batch_cmd(
     caption_fps: float = typer.Option(1.0, help="Frames/sec extracted from each clip"),
     caption_max_frames: int = typer.Option(16, help="Max frames sent to the VLM per object"),
     caption_max_side: int = typer.Option(448, help="Resize each frame's longer side to this many pixels"),
-    mask_model_path: Path = typer.Option(
-        ...,
-        help="SAM-2 checkpoint (.pt file), e.g. checkpoints/sam2.1_hiera_base_plus.pt",
+    mask_model_path: str = typer.Option(
+        "facebook/sam2.1-hiera-base-plus",
+        help="SAM-2 model: HuggingFace ID (e.g. facebook/sam2.1-hiera-base-plus) or local .pt path",
     ),
     catv_python: str = typer.Option(
         None,
-        help="Python interpreter for the SAM-2 batch step (must be the CAT-V env). "
-        "Defaults to the interpreter running this command.",
+        help="Python interpreter for the SAM-2 batch step. Defaults to sys.executable (current env).",
     ),
     qwen_vl_python: str = typer.Option(
-        "/home/jhlee/miniconda3/envs/sam2hf/bin/python",
-        help="Python interpreter for the Qwen3-VL batch step (must be the sam2hf env)",
+        None,
+        help="Python interpreter for the Qwen3-VL batch step. Defaults to sys.executable (current env).",
     ),
     catv_visualization_dir: Path = typer.Option(
         None,
@@ -736,9 +746,12 @@ def caption_bboxes_batch_cmd(
     """
     from egoownership.catv_pipeline import write_catv_captions_batch
 
+    ds = dataset or input_jsonl.parent.name
+    resolved_out = out or (Path("outputs") / ds / "captions.jsonl")
+
     n = write_catv_captions_batch(
         input_jsonl,
-        out,
+        resolved_out,
         mask_model_path=mask_model_path,
         catv_device=caption_device,
         fps=caption_fps,
@@ -755,7 +768,7 @@ def caption_bboxes_batch_cmd(
         resume=resume,
         show_progress=progress,
     )
-    _CONSOLE.print(f"[green]Wrote {n} CAT-V object captions (batch)[/green] → {out}")
+    _CONSOLE.print(f"[green]Wrote {n} CAT-V object captions (batch)[/green] → {resolved_out}")
 
 
 @app.command("one-pass-labels")
@@ -766,16 +779,17 @@ def one_pass_labels_cmd(
         help="Object-description JSONL from the caption-bboxes stage",
     ),
     out: Path = typer.Option(
-        ...,
-        help="Output JSONL with sparse benchmark frames, evidence, taxonomy, and auto GT labels",
+        None,
+        help="Output JSONL with sparse benchmark frames, evidence, taxonomy, and auto GT labels. "
+             "Defaults to outputs/{dataset}/labels.jsonl",
     ),
     dataset: str = typer.Option(
         None,
-        help="Optional dataset hint for progress labels (egolife, ego4d)",
+        help="Dataset name (egolife, ego4d, ...) used to derive default output paths",
     ),
     frames_dir: Path = typer.Option(
-        Path("outputs/one_pass_sparse_frames"),
-        help="Cache directory for sampled and selected t-2/t-1/t frames",
+        None,
+        help="Cache directory for sampled t-2/t-1/t frames. Defaults to outputs/{dataset}/one_pass_sparse_frames",
     ),
     detect_persons: bool = typer.Option(
         False,
@@ -815,12 +829,15 @@ def one_pass_labels_cmd(
     elif decision_backend != "rules":
         raise typer.BadParameter("--decision-backend must be 'rules' or 'llm'")
 
-    progress_desc = f"{dataset} one-pass labels" if dataset else "CAT-V one-pass labels"
+    ds = dataset or input_jsonl.parent.name
+    resolved_out = out or (Path("outputs") / ds / "labels.jsonl")
+    resolved_frames_dir = frames_dir or (Path("outputs") / ds / "one_pass_sparse_frames")
+    progress_desc = f"{ds} one-pass labels"
 
     n = write_one_pass_labels(
         input_jsonl,
-        out,
-        frames_dir=frames_dir,
+        resolved_out,
+        frames_dir=resolved_frames_dir,
         detect_persons=detect_persons,
         decision_fn=decision_fn,
         review_dir=review_dir,
@@ -831,7 +848,7 @@ def one_pass_labels_cmd(
         dataset=dataset,
         progress_desc=progress_desc,
     )
-    _CONSOLE.print(f"[green]Wrote {n} one-pass labels[/green] → {out}")
+    _CONSOLE.print(f"[green]Wrote {n} one-pass labels[/green] → {resolved_out}")
 
 
 @app.command("visualize-labels")

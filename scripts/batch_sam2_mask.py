@@ -51,6 +51,19 @@ from run_catv_one_object import (  # noqa: E402
 _COLOR = [(255, 0, 0)]
 
 
+_HF_MODEL_IDS = {
+    "facebook/sam2-hiera-tiny", "facebook/sam2-hiera-small",
+    "facebook/sam2-hiera-base-plus", "facebook/sam2-hiera-large",
+    "facebook/sam2.1-hiera-tiny", "facebook/sam2.1-hiera-small",
+    "facebook/sam2.1-hiera-base-plus", "facebook/sam2.1-hiera-large",
+}
+_DEFAULT_MODEL = "facebook/sam2.1-hiera-base-plus"
+
+
+def _is_hf_model_id(model_path: str) -> bool:
+    return model_path in _HF_MODEL_IDS or (not Path(model_path).exists() and "/" in model_path)
+
+
 def _determine_model_cfg(model_path: str) -> str:
     if "large" in model_path:
         return "configs/samurai/sam2.1_hiera_l.yaml"
@@ -204,20 +217,28 @@ def _process_one_job(predictor, job: dict, *, device: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Batch SAM-2 bidirectional tracking (model loaded once)")
     parser.add_argument("--jobs", required=True, type=Path, help="JSONL of SAM-2 masking jobs")
-    parser.add_argument("--model-path", required=True, help="Path to sam2.1_hiera_*.pt checkpoint")
+    parser.add_argument(
+        "--model-path",
+        default=_DEFAULT_MODEL,
+        help="HuggingFace model ID (e.g. facebook/sam2.1-hiera-base-plus) or local .pt checkpoint path. "
+             f"Defaults to {_DEFAULT_MODEL}.",
+    )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
     model_path = args.model_path
-    if not Path(model_path).exists():
-        raise FileNotFoundError(f"SAM-2 checkpoint not found: {model_path}")
-
-    from sam2.build_sam import build_sam2_video_predictor
-
-    model_cfg = _determine_model_cfg(model_path)
-    predictor = build_sam2_video_predictor(model_cfg, model_path, device=args.device)
+    if _is_hf_model_id(model_path):
+        from sam2.build_sam import build_sam2_video_predictor_hf
+        predictor = build_sam2_video_predictor_hf(model_path, device=args.device)
+        print(f"[batch_sam2_mask] SAM-2 loaded from HuggingFace: {model_path}", flush=True)
+    else:
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"SAM-2 checkpoint not found: {model_path}")
+        from sam2.build_sam import build_sam2_video_predictor
+        model_cfg = _determine_model_cfg(model_path)
+        predictor = build_sam2_video_predictor(model_cfg, model_path, device=args.device)
+        print(f"[batch_sam2_mask] SAM-2 loaded from {model_path}", flush=True)
     predictor.fill_hole_area = 0
-    print(f"[batch_sam2_mask] SAM-2 loaded from {model_path}", flush=True)
 
     jobs = [json.loads(line) for line in args.jobs.read_text(encoding="utf-8").splitlines() if line.strip()]
     total = len(jobs)

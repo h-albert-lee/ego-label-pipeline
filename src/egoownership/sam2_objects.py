@@ -126,8 +126,7 @@ class Sam2ObjectExtractor:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 "SAM-3 extraction requires a Transformers build with SAM-3 support. "
-                "Use the sam2hf environment, e.g. "
-                "`PYTHONPATH=src:eval /home/jhlee/miniconda3/envs/sam2hf/bin/python -m egoownership.cli ...`."
+                "Run from an environment that has sam2/transformers with SAM-3 support installed."
             ) from exc
 
         if self._pipeline is None:

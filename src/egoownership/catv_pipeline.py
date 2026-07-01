@@ -437,7 +437,7 @@ def write_catv_captions_batch(
     input_path: Path,
     out_path: Path,
     *,
-    mask_model_path: Path,
+    mask_model_path: str = "facebook/sam2.1-hiera-base-plus",
     catv_device: str = "cuda:0",
     fps: float = 1.0,
     whole_video: bool = True,
@@ -445,7 +445,7 @@ def write_catv_captions_batch(
     max_side: int = 448,
     captioner_backend: str = "qwen3vl",
     caption_model_path: str = "Qwen/Qwen3-VL-8B-Instruct",
-    qwen_vl_python: str = "/home/jhlee/miniconda3/envs/sam2hf/bin/python",
+    qwen_vl_python: str | None = None,
     catv_python: str | None = None,
     visualization_root: Path | None = None,
     batch_jobs_dir: Path | None = None,
@@ -507,7 +507,7 @@ def _write_catv_captions_batch_in_workdir(
     input_path: Path,
     out_path: Path,
     work_root: Path,
-    mask_model_path: Path,
+    mask_model_path: str,
     catv_device: str,
     fps: float,
     whole_video: bool,
@@ -541,7 +541,12 @@ def _write_catv_captions_batch_in_workdir(
     skipped_bad = 0
     skipped_existing = 0
 
-    for record in records_all:
+    _phase1_iter = records_all
+    if show_progress:
+        from tqdm.auto import tqdm
+        _phase1_iter = tqdm(records_all, desc="Phase 1 prepare", unit="row", dynamic_ncols=True)
+
+    for record in _phase1_iter:
         record_id = _record_output_id(record)
         if record_id in existing_ids:
             skipped_existing += 1
@@ -626,7 +631,7 @@ def _write_catv_captions_batch_in_workdir(
 
     # --- Phase 2: Run SAM-2 batch tracker ---
     print(f"[batch_captioning] Phase 2: SAM-2 tracking ({len(sam2_jobs)} jobs) …", flush=True)
-    catv_py = catv_python or sys.executable
+    catv_py = catv_python or qwen_vl_python or sys.executable
     batch_sam2_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_sam2_mask.py"
     _run_batch_subprocess(
         [
@@ -667,7 +672,7 @@ def _write_catv_captions_batch_in_workdir(
         batch_vl_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_qwen_vl_caption.py"
         _run_batch_subprocess(
             [
-                qwen_vl_python,
+                qwen_vl_python or sys.executable,
                 str(batch_vl_script),
                 "--jobs", str(vl_jobs_path),
                 "--model-path", caption_model_path,
@@ -686,8 +691,12 @@ def _write_catv_captions_batch_in_workdir(
     count = 0
     mode = "a" if resume else "w"
     written_ids = set(existing_ids)
+    _phase5_iter = job_by_id.items()
+    if show_progress:
+        from tqdm.auto import tqdm
+        _phase5_iter = tqdm(job_by_id.items(), desc="Phase 5 collect", unit="row", dynamic_ncols=True)
     with out_path.open(mode, encoding="utf-8") as handle:
-        for record_id, job in job_by_id.items():
+        for record_id, job in _phase5_iter:
             if record_id in written_ids:
                 continue
             record = record_by_id.get(record_id)
@@ -782,7 +791,13 @@ def _probe_video_wh(video_path: Path) -> tuple[int, int]:
 
 def _run_batch_subprocess(cmd: list[str], *, label: str) -> None:
     print(f"[{label}] running: {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def write_catv_captions_from_bbox_jsonl(
@@ -891,7 +906,6 @@ def write_caption_bboxes(
     resume: bool = True,
     show_progress: bool = True,
     ego4d_clip_window_sec: float | None = None,
-    ego4d_scratch_root: Path | None = None,
     ego4d_auto_download: bool = True,
     ego4d_require_observer: bool = True,
 ) -> int:
@@ -904,7 +918,6 @@ def write_caption_bboxes(
             "ego4d_clip_window_sec": ego4d_clip_window_sec
             if ego4d_clip_window_sec is not None
             else DEFAULT_CLIP_WINDOW_SEC,
-            "ego4d_scratch_root": ego4d_scratch_root,
             "ego4d_auto_download": ego4d_auto_download,
             "ego4d_require_observer": ego4d_require_observer,
         }

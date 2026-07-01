@@ -228,7 +228,6 @@ class GenericJsonlAdapter:
 class Ego4DCatVAdapter:
     dataset_id: str = "ego4d_fho"
     clip_window_sec: float = DEFAULT_CLIP_WINDOW_SEC
-    scratch_root: Path = field(default_factory=default_scratch_root)
     auto_download: bool = True
     require_observer: bool = True
 
@@ -336,11 +335,10 @@ class Ego4DCatVAdapter:
         if not video_id:
             return None
 
-        scratch_root = Path(self.scratch_root)
-        search_roots = [Path(videos_root), scratch_root]
-        full_video = locate_ego4d_full_video(video_id, *search_roots)
+        videos_root_path = Path(videos_root)
+        full_video = locate_ego4d_full_video(video_id, videos_root_path)
         if full_video is None and self.auto_download:
-            full_video = download_ego4d_video(video_id, scratch_root)
+            full_video = download_ego4d_video(video_id, videos_root_path)
 
         if full_video is None:
             return None
@@ -352,7 +350,7 @@ class Ego4DCatVAdapter:
             return full_video, max(0.0, local_start), 0.0
 
         cache_path = ego4d_subclip_cache_path(
-            scratch_root,
+            videos_root_path,
             video_id=video_id,
             clip_id=str(record.get("clip_id") or record.get("id") or video_id),
             window_start_sec=window_start,
@@ -564,7 +562,6 @@ def get_catv_dataset_adapter(
     dataset: str,
     *,
     ego4d_clip_window_sec: float = DEFAULT_CLIP_WINDOW_SEC,
-    ego4d_scratch_root: Path | None = None,
     ego4d_auto_download: bool = True,
     ego4d_require_observer: bool = True,
 ) -> CatVDatasetAdapter:
@@ -572,7 +569,6 @@ def get_catv_dataset_adapter(
     if key == "ego4d_fho":
         return Ego4DCatVAdapter(
             clip_window_sec=ego4d_clip_window_sec,
-            scratch_root=ego4d_scratch_root or default_scratch_root(),
             auto_download=ego4d_auto_download,
             require_observer=ego4d_require_observer,
         )
