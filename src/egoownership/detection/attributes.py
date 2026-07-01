@@ -3,7 +3,7 @@
 Strategy:
 
 1. Crop the bbox region with a small padding.
-2. Hand the crop to a VLM (BLIP-2 / LLaVA / Qwen-VL — whichever is locally
+2. Hand the crop to a VLM (BLIP-2 / LLaVA / Florence-2 — whichever is locally
    available). We default to BLIP-2 because it's small and license-permissive.
 3. Parse the freeform caption into the structured ``ObjectAttributes`` slots
    using a simple regex / keyword pass — perfect parsing isn't needed for a

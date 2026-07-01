@@ -114,7 +114,7 @@ def iter_fho_candidates(annotations_path: Path) -> Iterator[ClipCandidate]:
     Uses ``ijson`` when available to avoid loading the whole file into memory.
     Falls back to ``json.load`` for small fixtures.
     """
-
+    
     annotations_path = Path(annotations_path)
     try:
         import ijson  # type: ignore
@@ -130,7 +130,7 @@ def iter_fho_candidates(annotations_path: Path) -> Iterator[ClipCandidate]:
     except ImportError:
         with annotations_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        for clip in data.get("clips", []) or []:
+        for clip in (data.get("clips") or data.get("videos") or []):
             clip_uid = clip.get("clip_uid") or clip.get("clip_id") or ""
             video_uid = clip.get("video_uid") or clip.get("video_id")
             for ann in clip.get("annotations", []) or []:

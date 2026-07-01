@@ -1,6 +1,6 @@
-"""SAM2 mask refinement for boxes proposed by Grounding DINO.
+"""SAM/SAM-2 mask refinement for boxes proposed by Grounding DINO.
 
-Uses HuggingFace transformers SAM2 for simplicity. For EDA we only care about
+Uses HuggingFace transformers SAM/SAM-2 for simplicity. For EDA we only care about
 the *refined bbox* derived from the mask, not the mask itself, so we keep the
 surface minimal. If you need the raw mask, extend this module.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 from egoownership.schema import BBox, ObjectDetection
 
-_DEFAULT_MODEL = "facebook/sam2.1-hiera-tiny"
+_DEFAULT_MODEL = "facebook/sam-vit-base"
 
 
 @dataclass

@@ -64,6 +64,17 @@ egoown filter ego4d-fho \
     --taxonomy C \
     --out outputs/candidates_fho_C.jsonl
 
+egoown egolife-vlm-filter \
+    --annotations data/egolife/raw/EgoLifeCap \
+    --videos-root data/egolife/raw/data/EgoLife \
+    --model-id Qwen/Qwen2.5-VL-7B-Instruct \
+    --device cuda:0 \
+    --dtype float16 \
+    --min-visible-people 2 \
+    --require-face \
+    --split-by-person-day \
+    --out outputs/egolife_candidates_visual_filtered
+
 egoown extract-frames \
     --candidates outputs/candidates_fho_C.jsonl \
     --videos-root data/ego4d/videos \
@@ -79,11 +90,111 @@ egoown label \
     --detections outputs/detections.jsonl \
     --out outputs/scene_records.jsonl
 
+egoown eval-video-qa \
+    --model egothinker \
+    --config default \
+    --ground-truth-column rule_label \
+    --use-auth-token \
+    --out eval/outputs/egothinker_video_qa.csv
+
 egoown serve \
     --scenes outputs/scene_records.jsonl \
     --frames-root frames/ \
     --host 0.0.0.0 --port 8000
 ```
+
+## EgoLife draft annotations
+
+`egoown egolife-annotate` creates candidate ownership entries from EgoLife-style
+JSON/JSONL metadata or EgoLifeCap SRT directories. For `lmms-lab/EgoLife`, use
+`data/egolife/raw/EgoLifeCap` to pair `DenseCaption` cues with overlapping
+`Transcript` cues, or use `data/egolife/raw/EgoIT/*.json` for EgoIT caption/QA
+records.
+
+The optional `--visual-metadata` JSON/JSONL should be keyed by `clip_id`,
+`event_id`, or `id`, with fields such as `person_count` and `face_count`.
+Use `--require-visual-pass` to exclude clips whose visual metadata is missing
+or fails the person/face filters.
+
+The taxonomy divider uses as much existing annotation context as possible:
+`verb` / `action_verb`, `nouns` / `objects` / `target_objects`, `scenario`,
+`environment`, `scene`, `location`, `label`, `day`, `participant`, `task`, and
+`activity`. Temporal verbs such as pass/give/pick/place/serve are prioritized
+as Contextual Override candidates, affordance/identity/reflection cues become
+Conflict candidates, static spatial/shared-object cues become Baseline
+candidates, and weak or explicitly unclear captions become Ambiguous.
+
+By default the command writes the same compact `ClipCandidate`-style shape as
+`outputs/candidates_narration_A.jsonl`: `dataset`, `clip_id`, `video_id`,
+`taxonomy`, `t_minus_2_sec`, `t_minus_1_sec`, `t_sec`, `verb`, `nouns`,
+`narration`, and compact `source`. Use `--output-format draft` only when you
+want the verbose debugging record with all intermediate text signals.
+
+For EgoLife, run visual filtering directly from the EgoLifeCap annotations when
+video files are available. `egoown egolife-vlm-filter` builds candidate entries
+from caption/transcript cues, extracts the sparse `(t-2, t-1, t)` frames, asks
+an open-source VLM to count visible people and faces, and writes only candidates
+that pass the minimum-person / visible-face filter. It does not reject crowded
+or many-person scenes. The VLM metadata is embedded under each candidate's
+`source.visual_metadata`. With `--split-by-person-day`, `--out` is treated as a
+directory and outputs are saved as `<out>/<participant>/<day>.jsonl`.
+Candidates already rejected by the caption prefilter, for example explicit
+`alone` / `only me` / `혼자` cases, are written as rejected visual metadata
+without extracting frames or calling the VLM.
+
+## Egocentric video-QA evaluation
+
+Install the optional evaluation stack:
+
+```bash
+pip install -U -e ".[eval,dev]"
+```
+
+The benchmark is loaded with:
+
+```python
+datasets.load_dataset("Albertmade/ego-implicit-ownership-multiperson")
+```
+
+The Hugging Face repo is license-gated, so accept the dataset terms on the Hub
+and either run `huggingface-cli login` or pass `--hf-token`.
+
+Check the actual columns/features before running a model:
+
+```bash
+egoown eval-video-qa --inspect-only --config default --use-auth-token
+```
+
+Run a model evaluation:
+
+```bash
+egoown eval-video-qa \
+  --model egogpt \
+  --config default \
+  --ground-truth-column rule_label \
+  --use-auth-token \
+  --out eval/outputs/egogpt_video_qa.csv
+```
+
+Supported model keys are `egogpt`, `egothinker`, `egovlm`, and `egoreasoner`.
+Defaults are provided for EgoGPT, EgoThinker, and EgoVLM; pass `--model-id` or
+set `EGOOWN_EGOREASONER_MODEL_ID` for EgoReasoner if using a released checkpoint.
+
+Each prompt requires this output shape:
+
+```text
+Evidence: <step-by-step reasoning text>
+Answer: <integer option index>
+```
+
+The evaluator parses both fields, computes overall accuracy, and writes a CSV
+with `video_id`, `question`, `ground_truth`, `predicted_idx`, and
+`extracted_evidence` plus model/error metadata.
+
+For the `default` config, the dataset provides ownership annotations rather
+than explicit MCQA text. The evaluator synthesizes the question from
+`narration`, `verb`, and `nouns`, uses options `MINE`, `PERSON_k`, `SHARED`,
+and `AMBIGUOUS`, and uses `rule_label` as ground truth by default.
 
 ## Collaborative annotator UI
 
@@ -134,6 +245,8 @@ src/egoownership/
         store.py              # JSONL-backed store with file-locking
         entry.py              # uvicorn-reload entry point
         static/               # index.html + app.js + app.css
+eval/
+    ego_video_qa/              # HF benchmark loader, prompts, model wrappers, CSV evaluator
 configs/
     taxonomy.yaml             # verb/noun whitelists, zone thresholds
 tests/
