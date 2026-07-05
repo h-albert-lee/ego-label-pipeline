@@ -14,7 +14,10 @@ from rich.console import Console
 
 from egoownership import pipeline
 from egoownership.schema import Taxonomy
-from ego_video_qa.cli import register_eval_command
+try:
+    from ego_video_qa.cli import register_eval_command as _register_eval_command
+except ModuleNotFoundError:
+    _register_eval_command = None
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 download_app = typer.Typer(no_args_is_help=True, help="Dataset download helpers")
@@ -22,7 +25,8 @@ app.add_typer(download_app, name="download")
 
 _CONSOLE = Console()
 
-register_eval_command(app, _CONSOLE)
+if _register_eval_command is not None:
+    _register_eval_command(app, _CONSOLE)
 
 
 # ---------- downloads ----------
@@ -56,6 +60,75 @@ def download_hd_epic(
     """HD-EPIC annotation download instructions."""
     from egoownership.download import hd_epic
     hd_epic.download(out, videos=videos)
+
+
+# ---------- ego4d-fetch-clips ----------
+
+
+@app.command("ego4d-fetch-clips")
+def ego4d_fetch_clips_cmd(
+    input_jsonl: Path = typer.Option(
+        ...,
+        "--input",
+        help="BBox JSONL produced by extract-bboxes (ego4d dataset). "
+             "Must contain video_id, source_video_start_sec, catv_duration_sec, video_path.",
+    ),
+    full_video_dir: Path = typer.Option(
+        Path("data/ego4d/full_videos"),
+        help="Temporary directory for downloading Ego4D full-scale videos. "
+             "Each full video is deleted after its clips are extracted.",
+    ),
+    clips_dir: Path = typer.Option(
+        None,
+        help="Override clip output directory. Each clip is saved as "
+             "<clips-dir>/<video_id>/<original filename>. "
+             "If omitted, uses the video_path field from each record as-is.",
+    ),
+    limit: int = typer.Option(0, help="Hard cap on records processed (0 = no cap)"),
+    no_delete: bool = typer.Option(
+        False,
+        "--no-delete",
+        help="Keep full video after extracting clips (default: delete to save disk space)",
+    ),
+    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bars"),
+):
+    """Download Ego4D full videos, extract clips, delete full video.
+
+    Groups input records by video_id, downloads each full video once via the
+    official ego4d CLI, extracts each 30-second clip with ffmpeg (-c copy, no
+    re-encode), then deletes the full video to reclaim disk space.
+
+    After running this, the video_path fields in the JSONL already point to the
+    extracted clips, so subsequent extract-bboxes / caption-bboxes runs are fast
+    (no network fetch, no large-file seeking).
+
+    Requires:
+      - ego4d CLI installed: pip install ego4d
+      - ffmpeg on PATH
+    """
+    from egoownership.ego4d_video import fetch_ego4d_clips
+
+    if not input_jsonl.exists():
+        raise typer.BadParameter(f"Input JSONL not found: {input_jsonl}")
+
+    stats = fetch_ego4d_clips(
+        input_jsonl,
+        full_video_dir,
+        clips_dir=clips_dir,
+        limit=limit if limit > 0 else None,
+        show_progress=progress,
+        delete_full_video=not no_delete,
+    )
+
+    _CONSOLE.print(
+        f"[green]Done.[/green] "
+        f"total={stats['total']}  "
+        f"extracted={stats['extracted']}  "
+        f"skipped={stats['skipped']}  "
+        f"failed={stats['failed']}  "
+        f"videos_downloaded={stats['videos_downloaded']}  "
+        f"videos_deleted={stats['videos_deleted']}"
+    )
 
 
 # ---------- filter ----------
@@ -441,6 +514,7 @@ def sam2_extract_objects_cmd(
     if egolife_videos_root is not None:
         video_roots["egolife"] = egolife_videos_root
     if ego4d_videos_root is not None:
+        video_roots["ego4d"] = ego4d_videos_root
         video_roots["ego4d_fho"] = ego4d_videos_root
     skip_sources = {item.strip() for item in skip_source_datasets.split(",") if item.strip()}
     n = write_sam2_object_jsonl(
@@ -547,7 +621,7 @@ def extract_bboxes_cmd(
     _default_nouns = _data_dir / ds / f"{ds}_table_caption_object_nouns.jsonl"
     resolved_object_nouns = object_nouns or (_default_nouns if _default_nouns.exists() else None)
 
-    if ds == "ego4d_fho":
+    if ds in {"ego4d", "ego4d_fho"}:
         resolved_videos_root = videos_root or Path("data/ego4d/videos")
     elif videos_root is None:
         raise typer.BadParameter(f"--videos-root is required for --dataset {dataset}")
@@ -578,9 +652,9 @@ def extract_bboxes_cmd(
         limit=limit if limit > 0 else None,
         resume=resume,
         show_progress=progress,
-        ego4d_clip_window_sec=ego4d_clip_sec if ds == "ego4d_fho" else None,
-        ego4d_auto_download=auto_download if ds == "ego4d_fho" else False,
-        ego4d_require_observer=require_observer if ds == "ego4d_fho" else True,
+        ego4d_clip_window_sec=ego4d_clip_sec if ds in {"ego4d", "ego4d_fho"} else None,
+        ego4d_auto_download=auto_download if ds in {"ego4d", "ego4d_fho"} else False,
+        ego4d_require_observer=require_observer if ds in {"ego4d", "ego4d_fho"} else True,
     )
     _CONSOLE.print(f"[green]Wrote {n} {dataset} bbox rows[/green] → {resolved_out}")
 
@@ -709,7 +783,12 @@ def caption_bboxes_batch_cmd(
         "Qwen/Qwen3-VL-8B-Instruct",
         help="Captioning model id or local path",
     ),
-    caption_device: str = typer.Option("cuda:0", help="Device for both SAM-2 and the VLM"),
+    caption_device: str = typer.Option("cuda:0", help="Device for both SAM-2 and the VLM (used when --devices is not set)"),
+    devices: str = typer.Option(
+        None,
+        help="Comma-separated list of devices for parallel multi-GPU processing, e.g. cuda:0,cuda:1. "
+             "Overrides --caption-device.",
+    ),
     caption_fps: float = typer.Option(1.0, help="Frames/sec extracted from each clip"),
     caption_max_frames: int = typer.Option(16, help="Max frames sent to the VLM per object"),
     caption_max_side: int = typer.Option(448, help="Resize each frame's longer side to this many pixels"),
@@ -749,11 +828,14 @@ def caption_bboxes_batch_cmd(
     ds = dataset or input_jsonl.parent.name
     resolved_out = out or (Path("outputs") / ds / "captions.jsonl")
 
+    resolved_devices = [d.strip() for d in devices.split(",")] if devices else None
+
     n = write_catv_captions_batch(
         input_jsonl,
         resolved_out,
         mask_model_path=mask_model_path,
         catv_device=caption_device,
+        devices=resolved_devices,
         fps=caption_fps,
         whole_video=whole_video,
         max_frames=caption_max_frames,
@@ -796,13 +878,33 @@ def one_pass_labels_cmd(
         "--detect-persons/--no-detect-persons",
         help="Run person detector on target frame while building evidence labels",
     ),
+    sam3_model_id: str = typer.Option(
+        None,
+        help="SAM-3 HF model ID (e.g. facebook/sam3); if set, re-runs SAM-3 on frame t to refine the object bbox and skips entries with confidence ≤ 0.5",
+    ),
+    sam2_tracking_model_id: str = typer.Option(
+        None,
+        "--sam2-track",
+        help="SAM-2.1 checkpoint path for backward tracking (e.g. /path/to/sam2.1_hiera_base_plus.pt). "
+             "Re-extracts per-frame bbox for t-1/t-2 by propagating the t-frame mask backward. "
+             "Automatically enables --detect-persons.",
+    ),
+    sam2_tracking_device: str = typer.Option(
+        "cuda",
+        "--sam2-device",
+        help="Device for SAM-2 tracking (cuda, cuda:0, cpu)",
+    ),
     decision_backend: str = typer.Option(
         "rules",
         help="How to decide taxonomy/ground-truth from evidence: 'rules' or 'llm'",
     ),
+    object_type_backend: str = typer.Option(
+        "rules",
+        help="How to classify object type (personal/shared/generic_object): 'rules' or 'llm'",
+    ),
     decision_model_id: str = typer.Option(
         "Qwen/Qwen3-4B",
-        help="Text LLM checkpoint used when --decision-backend=llm",
+        help="Text LLM checkpoint used when --decision-backend=llm or --object-type-backend=llm",
     ),
     decision_device: str = typer.Option("auto", help="Device for the LLM decider: auto, cpu, cuda:0"),
     review_dir: Path = typer.Option(
@@ -829,6 +931,14 @@ def one_pass_labels_cmd(
     elif decision_backend != "rules":
         raise typer.BadParameter("--decision-backend must be 'rules' or 'llm'")
 
+    object_type_fn = None
+    if object_type_backend == "llm":
+        from egoownership.catv_evidence_label import LLMObjectTypeClassifier
+
+        object_type_fn = LLMObjectTypeClassifier(model_id=decision_model_id, device=decision_device)
+    elif object_type_backend != "rules":
+        raise typer.BadParameter("--object-type-backend must be 'rules' or 'llm'")
+
     ds = dataset or input_jsonl.parent.name
     resolved_out = out or (Path("outputs") / ds / "labels.jsonl")
     resolved_frames_dir = frames_dir or (Path("outputs") / ds / "one_pass_sparse_frames")
@@ -840,6 +950,10 @@ def one_pass_labels_cmd(
         frames_dir=resolved_frames_dir,
         detect_persons=detect_persons,
         decision_fn=decision_fn,
+        object_type_fn=object_type_fn,
+        sam3_model_id=sam3_model_id or None,
+        sam2_tracking_model_id=sam2_tracking_model_id or None,
+        sam2_tracking_device=sam2_tracking_device,
         review_dir=review_dir,
         review_max_width=review_max_width,
         limit=limit if limit > 0 else None,
@@ -925,6 +1039,132 @@ def egolife_review_gradio_cmd(
         port=port,
         share=share,
     )
+
+
+# ---------- vlm-crosscheck ----------
+
+
+@app.command("vlm-crosscheck")
+def vlm_crosscheck_cmd(
+    input_jsonl: Path = typer.Option(
+        ...,
+        "--input",
+        help="labels.jsonl produced by one-pass-labels",
+    ),
+    out: Path = typer.Option(
+        None,
+        help="Output JSONL with per-judge predictions and agreement stats. "
+             "Defaults to outputs/{dataset}/crosscheck.jsonl",
+    ),
+    dataset: str = typer.Option(
+        None,
+        help="Dataset name used to derive default output path (egolife, ego4d, …)",
+    ),
+    frames_root: Path = typer.Option(
+        None,
+        help="Root directory for resolving relative frame paths in the JSONL",
+    ),
+    judges: list[str] = typer.Option(
+        [],
+        "--judge",
+        help="Judge spec: 'qwen:<model_id>', 'anthropic:<model_id>', or 'openai:<model_id>'. "
+             "Repeat for multiple judges, e.g. --judge qwen:Qwen/Qwen2.5-VL-7B-Instruct "
+             "--judge anthropic:claude-sonnet-4-6",
+    ),
+    qwen_device: str = typer.Option("auto", help="Device for local Qwen VL judges"),
+    qwen_dtype: str = typer.Option("auto", help="Dtype for Qwen VL: auto, float16, bfloat16"),
+    qwen_max_tokens: int = typer.Option(256, help="Max new tokens for Qwen VL response"),
+    remote_max_tokens: int = typer.Option(512, help="Max tokens for Anthropic/OpenAI response"),
+    resume: bool = typer.Option(True, "--resume/--overwrite"),
+    limit: int = typer.Option(0, help="Hard cap on records processed (0 = no cap)"),
+    progress: bool = typer.Option(True, "--progress/--no-progress"),
+):
+    """Cross-check ownership labels with multiple VLM judges.
+
+    Each judge independently predicts MINE / PERSON_k / SHARED / AMBIGUOUS from
+    the three sparse frames + narration + object description, without seeing the
+    pipeline's own prediction.  Agreement with auto_ground_truth is recorded per
+    judge, along with a majority-vote label.
+
+    Examples:
+
+    \\b
+        # Two judges: local Qwen + Claude
+        egoown vlm-crosscheck \\
+            --input outputs/egolife/labels.jsonl \\
+            --judge qwen:Qwen/Qwen2.5-VL-7B-Instruct \\
+            --judge anthropic:claude-sonnet-4-6
+
+        # Three judges
+        egoown vlm-crosscheck \\
+            --input outputs/ego4d/labels.jsonl \\
+            --judge anthropic:claude-sonnet-4-6 \\
+            --judge openai:gpt-4o \\
+            --judge qwen:Qwen/Qwen2.5-VL-7B-Instruct
+    """
+    from egoownership.vlm_crosscheck import (
+        AnthropicOwnershipJudge,
+        AnthropicOwnershipJudgeConfig,
+        GeminiOwnershipJudge,
+        GeminiOwnershipJudgeConfig,
+        OpenAIOwnershipJudge,
+        OpenAIOwnershipJudgeConfig,
+        QwenOwnershipJudge,
+        QwenOwnershipJudgeConfig,
+        write_crosscheck_jsonl,
+    )
+
+    if not judges:
+        raise typer.BadParameter("Specify at least one --judge, e.g. --judge anthropic:claude-sonnet-4-6")
+
+    judge_objs = []
+    for spec in judges:
+        if ":" in spec:
+            backend, model_id = spec.split(":", 1)
+        else:
+            backend, model_id = spec, spec
+        backend = backend.lower()
+
+        if backend == "qwen":
+            judge_objs.append(QwenOwnershipJudge(QwenOwnershipJudgeConfig(
+                model_id=model_id,
+                device=qwen_device,
+                dtype=qwen_dtype,
+                max_new_tokens=qwen_max_tokens,
+            )))
+        elif backend == "anthropic":
+            judge_objs.append(AnthropicOwnershipJudge(AnthropicOwnershipJudgeConfig(
+                model_id=model_id,
+                max_tokens=remote_max_tokens,
+            )))
+        elif backend == "openai":
+            judge_objs.append(OpenAIOwnershipJudge(OpenAIOwnershipJudgeConfig(
+                model_id=model_id,
+                max_tokens=remote_max_tokens,
+            )))
+        elif backend == "gemini":
+            judge_objs.append(GeminiOwnershipJudge(GeminiOwnershipJudgeConfig(
+                model_id=model_id,
+                max_tokens=remote_max_tokens,
+            )))
+        else:
+            raise typer.BadParameter(
+                f"Unknown judge backend {backend!r}. Use qwen, anthropic, openai, or gemini."
+            )
+
+    ds = dataset or input_jsonl.parent.name
+    resolved_out = out or (Path("outputs") / ds / "crosscheck.jsonl")
+
+    n = write_crosscheck_jsonl(
+        input_jsonl,
+        resolved_out,
+        judge_objs,
+        frames_root=frames_root,
+        limit=limit if limit > 0 else None,
+        resume=resume,
+        show_progress=progress,
+    )
+    _CONSOLE.print(f"[green]Wrote {n} cross-check rows[/green] → {resolved_out}")
 
 
 # ---------- sam2-vlm-build ----------
@@ -1105,6 +1345,7 @@ def sam2_vlm_build_cmd(
     if egolife_videos_root is not None:
         video_roots["egolife"] = egolife_videos_root
     if ego4d_videos_root is not None:
+        video_roots["ego4d"] = ego4d_videos_root
         video_roots["ego4d_fho"] = ego4d_videos_root
     skip_sources = {item.strip() for item in skip_source_datasets.split(",") if item.strip()}
     n = write_sam2_vlm_object_labels(
@@ -1497,6 +1738,66 @@ def label_cmd(
 
 
 # ---------- serve (collaborative annotator) ----------
+
+
+@app.command("convert-to-server")
+def convert_to_server_cmd(
+    input_jsonl: Path = typer.Option(
+        ...,
+        "--input",
+        help="labels.jsonl produced by the one-pass-labels stage",
+    ),
+    out: Path = typer.Option(
+        None,
+        help="Output SceneRecord JSONL. Defaults to scene_records.jsonl next to --input",
+    ),
+    progress: bool = typer.Option(True, "--progress/--no-progress"),
+):
+    """Convert one-pass-labels JSONL to SceneRecord format for the review server.
+
+    Run this once after the one-pass-labels stage, then point 'ego-label serve'
+    at the output file.
+
+    Example workflow:
+
+    \b
+        ego-label convert-to-server --input outputs/egolife/labels.jsonl
+        ego-label serve --scenes outputs/egolife/scene_records.jsonl \\
+                        --frames-root outputs/egolife/one_pass_sparse_frames
+    """
+    from egoownership.catv_io import count_jsonl, iter_jsonl
+    from egoownership.catv_pipeline import labels_row_to_scene_record
+
+    if not input_jsonl.exists():
+        raise typer.BadParameter(f"File not found: {input_jsonl}")
+
+    resolved_out = out or input_jsonl.with_name("scene_records.jsonl")
+    resolved_out.parent.mkdir(parents=True, exist_ok=True)
+
+    records = iter_jsonl(input_jsonl, skip_bad=True)
+    if progress:
+        from tqdm.auto import tqdm
+        records = tqdm(records, total=count_jsonl(input_jsonl), unit="row", desc="converting")
+
+    n_ok = n_err = 0
+    with resolved_out.open("w", encoding="utf-8") as fh:
+        for row in records:
+            try:
+                scene_record = labels_row_to_scene_record(row)
+                fh.write(scene_record.model_dump_json() + "\n")
+                n_ok += 1
+            except Exception as exc:
+                n_err += 1
+                msg = f"[warn] skip {row.get('id', '?')}: {exc}"
+                if progress:
+                    from tqdm import tqdm as _tqdm
+                    _tqdm.write(msg)
+                else:
+                    print(msg, flush=True)
+
+    _CONSOLE.print(f"[green]Wrote {n_ok} SceneRecords[/green] → {resolved_out}")
+    if n_err:
+        _CONSOLE.print(f"[yellow]Skipped {n_err} rows (conversion errors)[/yellow]")
 
 
 @app.command("serve")
