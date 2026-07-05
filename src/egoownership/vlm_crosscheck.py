@@ -397,26 +397,87 @@ def _load_existing_ids(path: Path) -> set[str]:
     return ids
 
 
+def load_records_from_hf(
+    dataset_id: str,
+    split: str = "train",
+    frames_cache: Path | None = None,
+) -> tuple[list[dict], Path]:
+    """Load records from a HuggingFace dataset, saving embedded images to disk.
+
+    Returns (records, frames_cache_dir). The frame path keys in each record
+    are updated to point to the saved JPEG files so existing judge code works
+    without modification.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(dataset_id, split=split)
+
+    if frames_cache is None:
+        frames_cache = Path(tempfile.mkdtemp(prefix="vlm_crosscheck_hf_"))
+    else:
+        frames_cache = Path(frames_cache)
+        frames_cache.mkdir(parents=True, exist_ok=True)
+
+    _JSON_COLS = {"object", "nouns", "frame_times_sec", "frame_paths",
+                  "temporal_target_objects", "evidence", "described_frame_timestamps_sec"}
+    _IMAGE_KEYS = ("frame_t_minus_2_path", "frame_t_minus_1_path", "frame_t_path")
+
+    records = []
+    for i, row in enumerate(ds):
+        rec = dict(row)
+
+        for col in _JSON_COLS:
+            val = rec.get(col)
+            if isinstance(val, str) and val:
+                try:
+                    rec[col] = json.loads(val)
+                except json.JSONDecodeError:
+                    pass
+
+        for key in _IMAGE_KEYS:
+            img = rec.get(key)
+            if img is not None:
+                try:
+                    fpath = frames_cache / f"{i}_{key}.jpg"
+                    if not fpath.exists():
+                        img.save(fpath, quality=92)
+                    rec[key] = str(fpath)
+                except Exception:
+                    rec[key] = None
+
+        records.append(rec)
+
+    return records, frames_cache
+
+
 def write_crosscheck_jsonl(
-    labels_path: Path,
+    labels_path: Path | None,
     out_path: Path,
     judges: list[Any],
     *,
+    records: list[dict] | None = None,
     frames_root: Path | None = None,
     limit: int | None = None,
     resume: bool = True,
     show_progress: bool = True,
 ) -> int:
-    """Run all judges on each record in labels_path and write agreement stats.
+    """Run all judges on each record and write agreement stats.
+
+    Records can be supplied directly via ``records`` (e.g. loaded from HF) or
+    read from ``labels_path``.  At least one must be provided.
 
     Output schema per row:
       id, auto_ground_truth, judges: {model_id: {label, rationale, agrees}},
       agreement_count, agreement_ratio, majority_label
     """
+    if records is None:
+        if labels_path is None:
+            raise ValueError("Provide either labels_path or records.")
+        records = list(_iter_jsonl(labels_path))
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing_ids = _load_existing_ids(out_path) if resume else set()
 
-    records = list(_iter_jsonl(labels_path))
     if limit:
         records = records[:limit]
 
