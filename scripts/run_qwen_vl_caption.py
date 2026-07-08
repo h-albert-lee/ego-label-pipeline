@@ -2,8 +2,8 @@
 """Caption a SAM2-masked video clip with Qwen3-VL.
 
 Standalone alternative to CAT-V's InternVL-based ``scripts/get_caption.py``,
-used by ``run_catv_one_object.py`` when ``--captioner-backend qwen3vl`` is
-passed. Must run under an environment whose transformers build supports
+invoked per-shard by ``batch_qwen_vl_caption.py``. Must run under an
+environment whose transformers build supports
 ``Qwen3VLForConditionalGeneration`` (the InternVL/CAT-V ``test`` env does not;
 use the ``sam2hf`` env instead).
 """

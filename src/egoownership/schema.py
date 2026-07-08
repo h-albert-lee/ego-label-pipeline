@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -176,18 +176,22 @@ class AnnotationEdit(BaseModel):
 
 
 class VLMJudgement(BaseModel):
-    """A second-opinion ownership label proposed by a remote VLM (Claude / GPT-4o).
+    """A second-opinion ownership label proposed by a VLM judge (Claude / GPT-4o /
+    Gemini / Qwen), independently predicted from the raw frames alone — no
+    access to the pipeline's own evidence or prediction.
 
     Stored alongside the rule-cascade label, never replacing it. Surfaces in
-    the annotator UI so reviewers can compare the two signals.
+    the annotator UI so reviewers can compare the two signals aspect-by-aspect.
     """
 
-    provider: str  # "anthropic" | "openai"
-    model: str
+    model_id: str
     label: OwnershipLabel
-    confidence: float
-    rationale: str | None = None
-    target_instance_hint: str | None = None
+    agrees: bool | None = None
+    object_type_evidence: str | None = None
+    zone_evidence: str | None = None
+    relation_graph_evidence: str | None = None
+    context_change_evidence: str | None = None
+    rationale: str | None = None  # free-form fallback for judges that don't split by aspect
 
 
 class SceneRecord(BaseModel):
@@ -201,4 +205,7 @@ class SceneRecord(BaseModel):
     auto_label_confidence: float | None = None
     review_status: Literal["draft", "in_review", "verified", "rejected"] = "draft"
     edits: list[AnnotationEdit] = Field(default_factory=list)
-    vlm_judgement: VLMJudgement | None = None
+    vlm_judgements: dict[str, VLMJudgement] = Field(default_factory=dict)
+    vlm_agreement_ratio: float | None = None
+    vlm_majority_label: OwnershipLabel | None = None
+    auto_key_evidence: dict[str, Any] = Field(default_factory=dict)

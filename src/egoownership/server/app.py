@@ -45,7 +45,21 @@ class SceneUpdateBody(BaseModel):
     object_overrides: dict[str, OwnershipLabel] | None = None
 
 
+class EvidenceUpdateBody(BaseModel):
+    annotator: str = "anonymous"
+    object_type: str | None = None
+    target_zone: str | None = None
+    relations: list[dict[str, Any]] | None = None
+    rationale: str | None = None
+    selected_evidence: list[str] | None = None
+
+
 def _resolve_video(videos_root: Path | None, video_id: str) -> Path | None:
+    # video_id may be a leading-slash-stripped absolute path (from one-pass-labels pipeline).
+    # Reconstruct as absolute by prepending "/" and check if it exists.
+    abs_candidate = Path("/" + video_id)
+    if abs_candidate.exists():
+        return abs_candidate
     if videos_root is None:
         return None
     for ext in _VIDEO_EXTS:
@@ -88,7 +102,7 @@ def create_app(
     def runtime_config() -> dict[str, Any]:
         """Tell the frontend what the server has, so it can show/hide features."""
         return {
-            "videos_available": videos_root is not None,
+            "videos_available": True,
             "frames_root": str(frames_root),
         }
 
@@ -97,6 +111,8 @@ def create_app(
         status: str | None = None,
         taxonomy: str | None = None,
         label: str | None = None,
+        dataset: str | None = None,
+        vlm_agreement: str | None = None,  # agree | disagree | no_data
         sort: str = "default",  # default | confidence-asc | confidence-desc
     ) -> list[dict[str, Any]]:
         rows = store.list_summaries()
@@ -106,11 +122,24 @@ def create_app(
             rows = [r for r in rows if r["taxonomy"] == taxonomy]
         if label:
             rows = [r for r in rows if r["scene_label"] == label]
+        if dataset:
+            rows = [r for r in rows if r["dataset"] == dataset]
+        if vlm_agreement == "agree":
+            rows = [r for r in rows if r["vlm_agrees"] is True]
+        elif vlm_agreement == "disagree":
+            rows = [r for r in rows if r["vlm_agrees"] is False]
+        elif vlm_agreement == "no_data":
+            rows = [r for r in rows if not r["has_vlm_judgement"]]
         if sort == "confidence-asc":
             rows.sort(key=lambda r: (r["auto_label_confidence"] is None, r["auto_label_confidence"] or 0))
         elif sort == "confidence-desc":
             rows.sort(key=lambda r: -(r["auto_label_confidence"] or 0))
         return rows
+
+    @app.get("/api/datasets")
+    def list_datasets() -> list[str]:
+        """Distinct dataset values currently in the store, for the UI's filter dropdown."""
+        return sorted({r["dataset"] for r in store.list_summaries() if r.get("dataset")})
 
     @app.get("/api/scenes/{clip_id:path}")
     def get_scene(clip_id: str) -> dict[str, Any]:
@@ -118,6 +147,22 @@ def create_app(
         if rec is None:
             raise HTTPException(status_code=404, detail=f"clip {clip_id!r} not found")
         return rec.model_dump(mode="json")
+
+    @app.post("/api/scenes/{clip_id}/evidence")
+    @app.post("/api/scenes/{clip_id:path}/evidence")
+    def update_evidence(clip_id: str, body: EvidenceUpdateBody) -> dict[str, Any]:
+        updated = store.update_evidence(
+            clip_id,
+            annotator=body.annotator,
+            object_type=body.object_type,
+            target_zone=body.target_zone,
+            relations=body.relations,
+            rationale=body.rationale,
+            selected_evidence=body.selected_evidence,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"clip {clip_id!r} not found")
+        return updated.model_dump(mode="json")
 
     @app.post("/api/scenes/{clip_id:path}")
     def update_scene(clip_id: str, body: SceneUpdateBody) -> dict[str, Any]:
@@ -180,14 +225,14 @@ def create_app(
             raise HTTPException(status_code=404, detail="frame not found")
         return FileResponse(full)
 
-    @app.head("/video/{video_id}")
+    @app.head("/video/{video_id:path}")
     def video_head(video_id: str) -> Response:
         path = _resolve_video(videos_root, video_id)
         if path is None:
             return Response(status_code=404)
         return Response(status_code=200, headers={"Content-Length": str(path.stat().st_size)})
 
-    @app.get("/video/{video_id}")
+    @app.get("/video/{video_id:path}")
     def video_get(video_id: str, request: Request):
         """Serve a local video, supporting HTTP Range so the <video> element
         can seek to t-2 / t-1 / t timestamps without downloading the whole file.

@@ -28,8 +28,9 @@ from egoownership.schema import (
 )
 
 
-PersonDetector = Callable[[Path], list[PersonDetection]]
+PersonDetector = Callable[[Path], tuple[list[PersonDetection], BBox | None]]
 DecisionFn = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+_HELD_BY_WEARER_CONTAINMENT = 0.5
 
 _SHARED_OBJECTS = {
     "tissue",
@@ -52,36 +53,92 @@ _SHARED_OBJECTS = {
     "bin",
     "pot",
     "tray",
+    "cutlery",
+    "utensil",
+    "teapot",
+    "kettle",
+    "pan",
+    "frypan",
+    "saucepan",
+    "cooker",
+    "hotpot",
+    "chopboard",
+    "tablecloth",
+    "coaster",
+    "spatula",
+    "opener",
 }
 _PERSONAL_OBJECTS = {
     "phone",
     "smartphone",
+    "cellphone",
+    "iphone",
+    "ipad",
+    "mac",
     "laptop",
     "computer",
     "tablet",
     "notebook",
     "pen",
+    "pencil",
     "wallet",
+    "purse",
+    "handbag",
     "key",
+    "keys",
     "card",
     "bag",
     "watch",
+    "eyeglass",
     "charger",
     "cable",
     "usb",
+    "device",
+    "camera",
+    "microphone",
+    "headphone",
+    "earphone",
+    "keyboard",
+    "mouse",
+    "monitor",
+    "comb",
+    "razor",
+    "lotion",
+    "perfume",
+    "cigarette",
+    "lunchbox",
+    "money",
+    "ticket",
+    # Drinkware — a personal-function item like a phone or wallet: no
+    # ownership signal from function alone (rule 3), so it defaults to
+    # AMBIGUOUS absent a clue rather than SHARED. An individual cup/bottle
+    # can still resolve to SHARED via an explicit "shared_use" caption cue.
+    "cup",
+    "mug",
+    "tumbler",
+    "bottle",
+    "jar",
+    "straw",
 }
-_OWNERSHIP_HISTORY_VERBS = {
+# Ownership follows current physical location once the action completes —
+# whoever's zone the object ends up in at t is the new owner.
+_TRANSFER_VERBS = {
     "give",
     "pass",
     "hand",
     "receive",
     "serve",
     "offer",
-    "borrow",
     "return",
+}
+# Ownership stays with whoever *lent* the object — physical possession at t
+# is the opposite of who owns it (holding ≠ owning).
+_TEMPORARY_USE_VERBS = {
+    "borrow",
     "lend",
     "loan",
 }
+_OWNERSHIP_HISTORY_VERBS = _TRANSFER_VERBS | _TEMPORARY_USE_VERBS
 _OWNERSHIP_HISTORY_PATTERNS = (
     "originally",
     "previously",
@@ -178,6 +235,7 @@ def build_evidence_label(
     target_bbox = _bbox_from_dict(obj.get("bbox") or {})
     detector_error = temporal.get("detector_error")
     persons: list[PersonDetection] = []
+    ego_hand_bbox: BBox | None = None
     zones = static_zones(cfg.zones)
     relation_summary: list[dict[str, Any]] = []
     zone = "background_or_ambiguous_zone"
@@ -189,7 +247,7 @@ def build_evidence_label(
         relation_summary = list(current_snapshot.get("relations") or [])
     elif frame_path.exists() and target_bbox.x_max > target_bbox.x_min:
         try:
-            persons = person_detector(frame_path) if person_detector is not None else []
+            persons, ego_hand_bbox = person_detector(frame_path) if person_detector is not None else ([], None)
         except Exception as exc:  # noqa: BLE001
             detector_error = f"{type(exc).__name__}: {str(exc)[:300]}"
         zones = person_relative_zones(persons, cfg.zones) if persons else static_zones(cfg.zones)
@@ -215,6 +273,9 @@ def build_evidence_label(
             for rel in frame.relations
             if rel.subject_id == "target" or rel.object_id == "target"
         ]
+        wearer_relation = _held_by_wearer_relation(target_bbox, ego_hand_bbox)
+        if wearer_relation is not None:
+            relation_summary.append(wearer_relation)
 
     nearest_person = _nearest_person(target_bbox, persons)
     evidence = {
@@ -249,95 +310,219 @@ def _decide_taxonomy_gt(row: dict[str, Any], evidence: dict[str, Any]) -> dict[s
     relations = evidence.get("relations") or []
     verb = normalize_token(str(row.get("verb") or ""))
 
-    key: dict[str, Any] = {
-        "object_type": object_type,
-        "target_zone": zone,
-        "verb": verb,
-        "caption_cues": cues,
-        "person_count": evidence.get("person_count"),
-    }
+    key = _build_key_evidence(row, evidence, fallback_label=label)
 
-    if cues["ambiguous"] and not (cues["ego_actor"] or cues["other_actor"]):
-        return _decision(Taxonomy.AMBIGUOUS, OwnershipLabel.AMBIGUOUS, 0.72, key, "Actor/ownership evidence is explicitly ambiguous.")
+    _zone_desc = {
+        "ego_zone": "the camera-wearer's near zone",
+        "other_person_zone": "another person's spatial zone",
+        "shared_zone": "the shared table zone",
+        "center_table": "the central table area",
+    }.get(zone, f"the {zone} area")
+    _obj_type_desc = {
+        "shared": "a shared-use object",
+        "personal": "a personal object",
+        "generic_object": "a generic object",
+    }.get(object_type, object_type)
 
-    contextual = (
-        verb in _OWNERSHIP_HISTORY_VERBS
-        or bool((evidence.get("temporal") or {}).get("contextual_requires_history"))
-    )
+    temporal = evidence.get("temporal") or {}
+    contextual = verb in _OWNERSHIP_HISTORY_VERBS or bool(temporal.get("contextual_requires_history"))
     conflict = cues["conflict_cue"]
     if object_type == "shared" and zone == "ego_zone":
         conflict = True
     if object_type == "personal" and zone in {"shared_zone", "other_person_zone"}:
         conflict = True
+    if cues["ego_actor"] and cues["other_actor"]:
+        # Caption describes both the wearer and another person acting on the
+        # target — a genuine contradiction, not just "no signal", so it
+        # shouldn't look identical to a caption that said nothing at all.
+        conflict = True
 
+    gt: OwnershipLabel | None = None
+    rationale = ""
+
+    # ---- Tier 0: functional invariant — outranks everything below,
+    # including an explicitly-ambiguous caption, since a shared object's
+    # label doesn't depend on who's currently touching it.
     explicit_shared_gt = cues["shared_use"] or object_type == "shared"
     if explicit_shared_gt:
         gt = OwnershipLabel.SHARED
-        confidence = 0.82
-        rationale = "Caption or object type indicates shared/common use."
-    elif cues["other_actor"] and not cues["ego_actor"]:
+        rationale = (
+            f"The target is {_obj_type_desc} and the description indicates shared or communal use, "
+            f"placing it in {_zone_desc}."
+        )
+
+    if gt is None and cues["ambiguous"] and not (cues["ego_actor"] or cues["other_actor"]):
+        return _decision(
+            Taxonomy.AMBIGUOUS, OwnershipLabel.AMBIGUOUS, key,
+            f"The description mentions {_obj_type_desc} but actor identity is explicitly ambiguous "
+            f"with no clear ownership signal.",
+        )
+
+    # ---- Tier 2: caption history-verb, resolved via *zone* rather than the
+    # (noisier) actor-cue text — checked before the plainer relation/actor
+    # tiers below, since an explicit transfer/loan verb is the most specific
+    # signal available when present. Transfer verbs (give/pass/receive/
+    # return/...) mean ownership follows wherever the object ends up;
+    # temporary-use verbs (borrow/lend/loan) mean the opposite — physical
+    # possession right now is on loan, not owned.
+    if gt is None and verb in _TRANSFER_VERBS:
+        if zone == "ego_zone":
+            gt = OwnershipLabel.MINE
+            rationale = (
+                f"The description describes a transfer ('{verb}'), and the target now sits in {_zone_desc}, "
+                f"so the camera wearer is the resulting owner."
+            )
+        elif zone == "other_person_zone":
+            gt = OwnershipLabel.PERSON_K
+            rationale = (
+                f"The description describes a transfer ('{verb}'), and the target now sits in {_zone_desc}, "
+                f"so that visible person is the resulting owner."
+            )
+    elif gt is None and verb in _TEMPORARY_USE_VERBS:
+        if zone == "ego_zone":
+            gt = OwnershipLabel.PERSON_K
+            rationale = (
+                f"The description describes temporary use ('{verb}'); the camera wearer currently holds the "
+                f"target in {_zone_desc}, but holding is not owning — it appears to be on loan from another person."
+            )
+        elif zone == "other_person_zone":
+            gt = OwnershipLabel.MINE
+            rationale = (
+                f"The description describes temporary use ('{verb}'); another person currently holds the target "
+                f"in {_zone_desc}, but holding is not owning — it appears to be the camera wearer's own item, lent out."
+            )
+
+    # ---- Tier 1: direct relation-graph possession. A specific person's (or
+    # the wearer's own, via the dedicated ego-hand box) hand currently
+    # overlapping the target is stronger, more current evidence than a bare
+    # caption mention of who "the actor" is.
+    if gt is None:
+        # The dedicated ego-hand box is a more specific, purpose-built signal
+        # than the generic person-hand-zone heuristic (lower 40% of a whole
+        # detected body), so it takes priority if both happen to overlap the
+        # target — not just whichever relation appears first in the list.
+        held_by_wearer = any(
+            rel.get("predicate") == "held_by" and rel.get("object_id") == "wearer" for rel in relations
+        )
+        held_by_person = any(
+            rel.get("predicate") == "held_by" and str(rel.get("object_id") or "").startswith("person_")
+            for rel in relations
+        )
+        if held_by_wearer:
+            gt = OwnershipLabel.MINE
+            rationale = (
+                f"The target spatially overlaps the camera wearer's own detected hand region, "
+                f"suggesting the wearer is holding or primarily using it."
+            )
+        elif held_by_person:
+            gt = OwnershipLabel.PERSON_K
+            rationale = (
+                f"The target spatially overlaps with another person's hand region, "
+                f"suggesting it is held or primarily used by that person."
+            )
+
+    # ---- Plain caption actor cue (no history verb involved).
+    if gt is None and cues["other_actor"] and not cues["ego_actor"]:
         gt = OwnershipLabel.PERSON_K
-        confidence = 0.78
-        rationale = "Other visible person is the main actor interacting with the target."
-    elif cues["ego_actor"] and not cues["other_actor"]:
+        rationale = (
+            f"Another visible person is the primary actor interacting with the target, "
+            f"while the camera wearer is not described as acting on it. "
+            f"The object appears in {_zone_desc}."
+        )
+    elif gt is None and cues["ego_actor"] and not cues["other_actor"]:
         gt = OwnershipLabel.MINE
-        confidence = 0.80
-        rationale = "Camera wearer/ego hand is the main actor interacting with the target."
-    elif any(rel.get("predicate") == "held_by" and str(rel.get("object_id", "")).startswith("person_") for rel in relations):
-        gt = OwnershipLabel.PERSON_K
-        confidence = 0.72
-        rationale = "Target overlaps an other-person hand zone."
-    elif zone == "other_person_zone":
-        gt = OwnershipLabel.PERSON_K
-        confidence = 0.66
-        rationale = "Target is spatially closest to another visible person."
-    elif object_type == "shared" and zone in {"shared_zone", "center_table"}:
-        gt = OwnershipLabel.SHARED
-        confidence = 0.76
-        rationale = "Shared-type object lies in a shared/central table zone."
-    elif zone == "ego_zone":
-        gt = OwnershipLabel.MINE
-        confidence = 0.66
-        rationale = "Target is in the camera-wearer/near zone."
-    elif zone in {"shared_zone", "center_table"}:
-        gt = OwnershipLabel.SHARED if object_type == "shared" else OwnershipLabel.AMBIGUOUS
-        confidence = 0.62 if gt is OwnershipLabel.SHARED else 0.50
-        rationale = "Target lies in the shared band, but actor evidence is weak."
-    else:
-        gt = OwnershipLabel.AMBIGUOUS
-        confidence = 0.45
-        rationale = "Insufficient actor, object-type, and zone evidence."
+        rationale = (
+            f"The camera wearer is the primary actor in the description and is directly interacting with the target. "
+            f"The object is located in {_zone_desc}."
+        )
+
+    # ---- Tier 3: zone fallback, with a temporal abandonment check: a
+    # personal object relocated to the shared zone with no current actor
+    # cue stays MINE if it was in the wearer's zone earlier in the clip —
+    # relocating it doesn't relinquish ownership.
+    if gt is None:
+        # object_type == "shared" can't reach here — Tier 0 already resolved
+        # it unconditionally above — so the shared-zone branches below only
+        # ever see "personal" or "generic_object".
+        if zone == "other_person_zone":
+            gt = OwnershipLabel.PERSON_K
+            rationale = (
+                f"The target is located in {_zone_desc}, close to another visible person, "
+                f"with no strong actor cue pointing to the camera wearer."
+            )
+        elif zone == "ego_zone":
+            gt = OwnershipLabel.MINE
+            rationale = (
+                f"The target is in {_zone_desc}, close to the camera wearer, "
+                f"and no actor cue points to another person."
+            )
+        elif zone in {"shared_zone", "center_table"} and object_type == "personal" and temporal.get("ownership_trajectory") == "ego_to_shared":
+            gt = OwnershipLabel.MINE
+            contextual = True
+            rationale = (
+                f"The target is {_obj_type_desc} now resting in {_zone_desc} with no current actor cue, but it "
+                f"was in the camera-wearer's zone earlier in the clip — relocating it to a shared surface doesn't "
+                f"relinquish ownership."
+            )
+        elif zone in {"shared_zone", "center_table"}:
+            gt = OwnershipLabel.AMBIGUOUS
+            rationale = (
+                f"The target lies in {_zone_desc} but actor evidence is weak, "
+                f"making ownership difficult to determine from spatial position alone."
+            )
+        else:
+            gt = OwnershipLabel.AMBIGUOUS
+            rationale = (
+                f"There is insufficient actor, object-type, or spatial evidence to assign ownership confidently. "
+                f"The target ({_obj_type_desc}) does not fall clearly into any person's zone."
+            )
+
+    # ---- Past-frame fallback: only reached if everything above still left
+    # us with AMBIGUOUS.
+    used_past_frame_fallback = False
+    if gt is OwnershipLabel.AMBIGUOUS:
+        past = _gt_from_past_frame_clue(temporal)
+        if past is not None:
+            gt, past_tag = past
+            used_past_frame_fallback = True
+            contextual = True
+            past_zone_desc = "the camera-wearer's zone" if gt is OwnershipLabel.MINE else "another visible person's zone"
+            rationale = (
+                f"The target gives no clear zone or actor evidence at the current frame ({_zone_desc}), "
+                f"but it was in {past_zone_desc} at frame {past_tag}, so ownership is carried forward from that clue."
+            )
 
     if gt is OwnershipLabel.AMBIGUOUS:
         tax = Taxonomy.AMBIGUOUS
     elif contextual:
         tax = Taxonomy.CONTEXTUAL
-        temporal = evidence.get("temporal") or {}
-        if temporal.get("contextual_requires_history") and verb not in _OWNERSHIP_HISTORY_VERBS:
+        if (
+            not used_past_frame_fallback
+            and temporal.get("contextual_requires_history")
+            and verb not in _OWNERSHIP_HISTORY_VERBS
+        ):
             past_tags = [tag for tag in ("t-2", "t-1") if tag in (temporal.get("frame_snapshots") or {})]
             rationale = (
-                f"{rationale} Ownership clue visible in past frames ({', '.join(past_tags)}) "
-                f"but not at t (zone={temporal.get('current_frame_zone', zone)})."
+                f"{rationale} An ownership clue is visible in past frames ({', '.join(past_tags)}) "
+                f"but not at the action moment (current zone: {temporal.get('current_frame_zone', zone)})."
             )
     elif conflict:
         tax = Taxonomy.CONFLICT
     else:
         tax = Taxonomy.BASELINE
-    return _decision(tax, gt, confidence, key, rationale)
+    return _decision(tax, gt, key, rationale)
 
 
 def _decision(
     taxonomy: Taxonomy,
     gt: OwnershipLabel,
-    confidence: float,
     key: dict[str, Any],
     rationale: str,
 ) -> dict[str, Any]:
     return {
         "taxonomy": taxonomy.value,
         "ground_truth": gt.value,
-        "confidence": confidence,
-        "key_evidence": key,
+        "key_evidence": {**key, "rationale": _sentence(rationale) or rationale},
         "rationale": rationale,
     }
 
@@ -394,7 +579,7 @@ _LLM_DECISION_SYSTEM_PROMPT = (
     "owns/uses it), SHARED (communal/shared-use object), AMBIGUOUS.\n\n"
     "Respond with ONLY a single JSON object, no prose, no markdown fences, in this exact shape:\n"
     '{"taxonomy": "A|B|C|D", "ground_truth": "MINE|PERSON_k|SHARED|AMBIGUOUS", '
-    '"confidence": 0.0-1.0, "rationale": "one or two sentences"}'
+    '"rationale": "one or two sentences"}'
 )
 
 
@@ -428,7 +613,6 @@ class LLMTaxonomyDecider:
         return {
             "taxonomy": parsed["taxonomy"],
             "ground_truth": parsed["ground_truth"],
-            "confidence": parsed["confidence"],
             "key_evidence": packet,
             "rationale": parsed["rationale"],
         }
@@ -490,17 +674,154 @@ def _parse_llm_decision(raw: str) -> dict[str, Any] | None:
     ground_truth = gt_lookup.get(ground_truth.upper())
     if ground_truth is None:
         return None
-    try:
-        confidence = float(data.get("confidence"))
-    except (TypeError, ValueError):
-        return None
-    confidence = max(0.0, min(1.0, confidence))
     rationale = str(data.get("rationale") or "").strip() or "LLM decision (no rationale given)."
     return {
         "taxonomy": taxonomy,
         "ground_truth": ground_truth,
-        "confidence": confidence,
         "rationale": rationale,
+    }
+
+
+def _compact_prose(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _sentence(value: Any) -> str:
+    text = _compact_prose(value)
+    if not text:
+        return ""
+    if text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+def _caption_interaction_evidence(row: dict[str, Any]) -> str:
+    object_caption = str(row.get("object_caption") or "")
+    match = re.search(r"\(3\)\s*(.*?)(?=\n\s*\(\d+\)|$)", object_caption, flags=re.DOTALL)
+    if match:
+        first_line = next((line.strip() for line in match.group(1).splitlines() if line.strip()), "")
+        if first_line:
+            first_sentence = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0]
+            return _sentence(first_sentence)
+
+    for key in ("dense_caption_en", "transcript"):
+        text = _sentence(row.get(key))
+        if text:
+            return text
+    return "No caption interaction evidence was recorded for this target."
+
+
+def _summarize_relations(relations: list[dict[str, Any]]) -> str:
+    if not relations:
+        return "No explicit relation graph edge was recorded for the target object."
+    parts: list[str] = []
+    for rel in relations[:6]:
+        predicate = rel.get("predicate") or "related_to"
+        obj = rel.get("object_id") or "unknown"
+        note = rel.get("note")
+        if predicate == "held_by" and obj == "wearer":
+            phrase = "The target object is held by or overlaps the camera wearer's own detected hand"
+        elif predicate == "held_by":
+            phrase = f"The target object is held by or overlaps the hand zone of {obj}"
+        elif predicate == "on_shared_band":
+            phrase = "The target object lies in the shared table band"
+        elif predicate == "next_to":
+            phrase = f"The target object is spatially next to {obj}"
+        else:
+            phrase = f"The target object has relation '{predicate}' with {obj}"
+        if note:
+            phrase += f", with note '{note}'"
+        parts.append(phrase)
+    return _sentence(" ".join(_sentence(part) for part in parts))
+
+
+def _summarize_context_change(temporal: dict[str, Any]) -> str:
+    snapshots = temporal.get("frame_snapshots") if isinstance(temporal, dict) else None
+    if not isinstance(snapshots, dict):
+        return "No separate t-2/t-1 context change evidence was recorded."
+
+    ordered = [(tag, snapshots.get(tag)) for tag in ("t-2", "t-1", "t")]
+    snippets: list[str] = []
+    for tag, snap in ordered:
+        # A missing snapshot means that frame was never analyzed (e.g. SAM-2
+        # tracking lost the object) — distinct from an analyzed frame with an
+        # unresolved zone, so it must be omitted rather than reported as
+        # "unknown_zone" / "not held", which would fabricate evidence for a
+        # frame we have no data for at all.
+        if not isinstance(snap, dict) or not snap:
+            continue
+        zone = snap.get("target_zone") or "unknown_zone"
+        held_by = snap.get("held_by") or "not_held"
+        snippets.append(f"At {tag}, the target is in {zone} and is {held_by if held_by != 'not_held' else 'not held by a detected person'}")
+
+    changes: list[str] = []
+    t2 = snapshots.get("t-2")
+    t1 = snapshots.get("t-1")
+    t = snapshots.get("t")
+    # Truthiness (not just isinstance-dict) matters here too — an empty dict
+    # from a frame that was never analyzed must not be compared as if it were
+    # real (unchanged) data.
+    if isinstance(t2, dict) and t2 and isinstance(t, dict) and t:
+        if t2.get("target_zone") != t.get("target_zone"):
+            changes.append(f"Across the sparse frames, the zone changes from {t2.get('target_zone') or 'unknown'} to {t.get('target_zone') or 'unknown'}")
+        if t2.get("held_by") != t.get("held_by"):
+            changes.append(f"Across the sparse frames, the holder changes from {t2.get('held_by') or 'not_held'} to {t.get('held_by') or 'not_held'}")
+    if isinstance(t1, dict) and t1 and isinstance(t, dict) and t and t1.get("held_by") != t.get("held_by"):
+        changes.append(f"Between t-1 and t, the holder changes from {t1.get('held_by') or 'not_held'} to {t.get('held_by') or 'not_held'}")
+
+    base = " ".join(_sentence(snippet) for snippet in snippets)
+    if changes:
+        base += " " + " ".join(_sentence(change) for change in changes)
+    return base
+
+
+def _build_key_evidence(
+    row: dict[str, Any], evidence: dict[str, Any], *, fallback_label: str = "object"
+) -> dict[str, Any]:
+    """Prose-form summary of the evidence actually available for a decision.
+
+    Same shape the review server builds on the fly for its evidence panel —
+    generated once here so ``auto_key_evidence`` in labels.jsonl is already
+    complete and human-readable, instead of a decision-agnostic snapshot of
+    a few raw fields that leaves out exactly the evidence (relations,
+    temporal) that decides many rows.
+    """
+    object_type = evidence.get("object_type", "generic_object")
+    target_zone = evidence.get("target_zone", "background_or_ambiguous_zone")
+    relations = evidence.get("relations") or []
+    temporal = evidence.get("temporal") or {}
+    target_object = evidence.get("target_object", fallback_label)
+
+    nearest = evidence.get("nearest_other_person") or {}
+    nearest_text = ""
+    if isinstance(nearest, dict) and nearest:
+        nearest_text = (
+            f" The nearest other-person cue is {nearest.get('person_id', 'unknown')} "
+            f"at distance {nearest.get('distance', 'unknown')}."
+        )
+
+    zone_evidence = _sentence(
+        f"The target object is assigned to {target_zone}."
+        f"{nearest_text} Visible other person is {evidence.get('visible_other_person', False)}"
+    )
+    object_type_evidence = _sentence(f"The target object '{target_object}' is categorized as {object_type}")
+
+    return {
+        "target_object": target_object,
+        "object_type": object_type,
+        "object_type_evidence": object_type_evidence,
+        "target_zone": target_zone,
+        "zone_evidence": zone_evidence,
+        "caption_evidence": _caption_interaction_evidence(row),
+        "relation_graph_evidence": _summarize_relations(relations if isinstance(relations, list) else []),
+        "context_change_evidence": _summarize_context_change(temporal if isinstance(temporal, dict) else {}),
+        "verb": normalize_token(str(row.get("verb") or "")),
+        "person_count": evidence.get("person_count", 0),
+        "caption_cues": evidence.get("caption_cues") or {},
+        "relations": relations,
+        "temporal": temporal,
     }
 
 
@@ -663,6 +984,8 @@ def _build_temporal_evidence(
     frames: list[FrameDetections] = []
     detector_error: str | None = None
     analyzed_tags: list[str] = []
+    ego_hand_by_tag: dict[str, BBox | None] = {}
+    target_bbox_by_tag: dict[str, BBox] = {}
 
     for tag in _TEMPORAL_FRAME_TAGS:
         obj = temporal_objects.get(tag)
@@ -678,11 +1001,14 @@ def _build_temporal_evidence(
             frame_times.get(tag, row.get("first_frame_sec") or row.get("catv_start_sec") or row.get("start_sec") or 0.0)
         )
         persons: list[PersonDetection] = []
+        ego_hand_bbox: BBox | None = None
         if person_detector is not None and frame_path is not None and frame_path.exists():
             try:
-                persons = person_detector(frame_path)
+                persons, ego_hand_bbox = person_detector(frame_path)
             except Exception as exc:  # noqa: BLE001
                 detector_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+        ego_hand_by_tag[tag] = ego_hand_bbox
+        target_bbox_by_tag[tag] = bbox
         zones = person_relative_zones(persons, cfg.zones) if persons else static_zones(cfg.zones)
         frames.append(
             FrameDetections(
@@ -733,6 +1059,11 @@ def _build_temporal_evidence(
             for rel in fd.relations
             if rel.subject_id == "target" or rel.object_id == "target"
         ]
+        wearer_relation = _held_by_wearer_relation(
+            target_bbox_by_tag.get(fd.tag, target_obj.bbox), ego_hand_by_tag.get(fd.tag)
+        )
+        if wearer_relation is not None:
+            relations.append(wearer_relation)
         snapshots[fd.tag] = {
             "tag": fd.tag,
             "target_zone": zone,
@@ -776,13 +1107,36 @@ def _persons_from_snapshot(snapshot: dict[str, Any]) -> list[PersonDetection]:
 
 
 def _held_by_person(relations: list[dict[str, Any]]) -> str | None:
+    """Return the holder of a ``held_by`` relation — a ``person_*`` id, or
+    ``"wearer"`` when the target overlaps the camera wearer's own hand."""
     for rel in relations:
         if rel.get("predicate") != "held_by":
             continue
         holder = str(rel.get("object_id") or "")
-        if holder.startswith("person_"):
+        if holder.startswith("person_") or holder == "wearer":
             return holder
     return None
+
+
+def _held_by_wearer_relation(target_bbox: BBox, ego_hand_bbox: BBox | None) -> dict[str, Any] | None:
+    """Containment check against the wearer's own detected hand/arm box.
+
+    The ego-hand box comes from Grounding DINO's "a person." prompt firing on
+    an arm reaching into frame — it's a loose region covering the whole
+    reach, not a tight hand-only box, so it's often much larger than a small
+    held object. Plain IoU penalizes that size mismatch too harshly (a phone
+    fully inside a wide forearm box can score IoU < 0.05); what actually
+    matters is how much of the *target* sits inside it.
+    """
+    if ego_hand_bbox is None or target_bbox.area <= 0:
+        return None
+    ix1, iy1 = max(target_bbox.x_min, ego_hand_bbox.x_min), max(target_bbox.y_min, ego_hand_bbox.y_min)
+    ix2, iy2 = min(target_bbox.x_max, ego_hand_bbox.x_max), min(target_bbox.y_max, ego_hand_bbox.y_max)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    containment = inter / target_bbox.area
+    if containment <= _HELD_BY_WEARER_CONTAINMENT:
+        return None
+    return {"subject_id": "target", "object_id": "wearer", "predicate": "held_by", "score": containment}
 
 
 def _snapshot_ownership_clue(snapshot: dict[str, Any] | None) -> bool:
@@ -795,6 +1149,32 @@ def _snapshot_ownership_clue(snapshot: dict[str, Any] | None) -> bool:
     if snapshot.get("held_by"):
         return True
     return any(rel.get("predicate") == "held_by" for rel in (snapshot.get("relations") or []))
+
+
+def _gt_from_past_frame_clue(temporal: dict[str, Any]) -> tuple[OwnershipLabel, str] | None:
+    """When frame ``t`` alone gives no ownership clue, fall back to the
+    nearest past frame (``t-1``, then ``t-2``) that had one, using that
+    frame's zone/holder rather than giving up as AMBIGUOUS. Requires
+    ``--sam2-track`` to have populated real t-2/t-1 boxes; absent that,
+    ``frame_snapshots`` only ever has (at most) a ``"t"`` entry and this
+    always returns ``None``.
+    """
+    snapshots = temporal.get("frame_snapshots") or {}
+    for tag in ("t-1", "t-2"):
+        snapshot = snapshots.get(tag)
+        if not _snapshot_ownership_clue(snapshot):
+            continue
+        held_by = snapshot.get("held_by")
+        if held_by == "wearer":
+            return OwnershipLabel.MINE, tag
+        if held_by:
+            return OwnershipLabel.PERSON_K, tag
+        zone = str(snapshot.get("target_zone") or "")
+        if zone == "ego_zone":
+            return OwnershipLabel.MINE, tag
+        if zone == "other_person_zone":
+            return OwnershipLabel.PERSON_K, tag
+    return None
 
 
 def _zone_bucket(zone: str) -> str:

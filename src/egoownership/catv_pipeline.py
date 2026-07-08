@@ -17,15 +17,16 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import shlex
 import subprocess
 import sys
 import tempfile
 import textwrap
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -43,21 +44,7 @@ from egoownership.catv_io import (
     safe_path_part,
 )
 from egoownership.sam2_objects import Sam2ObjectExtractor, _nms_objects
-
-
-class ObjectCaptioner(Protocol):
-    model_id: str
-
-    def caption(
-        self,
-        *,
-        video_path: Path,
-        first_frame_path: Path,
-        bbox: dict[str, float],
-        record: dict[str, Any],
-        object_index: int,
-    ) -> str:
-        """Return an object-centric caption for one object box."""
+from egoownership.schema import BBox
 
 
 @dataclass
@@ -71,131 +58,6 @@ class SparseFrameSelection:
     frame_target_objects: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
-@dataclass
-class CatVCommandCaptioner:
-    """Run CAT-V through a shell command template.
-
-    Available placeholders:
-    ``{video_path}``, ``{first_frame_path}``, ``{bbox_path}``, ``{output_json}``,
-    ``{work_dir}``, ``{object_index}``, ``{caption}``, ``{object_nouns}``,
-    ``{start_sec}``, ``{end_sec}``, ``{duration_sec}``.
-
-    The command should write a JSON/JSONL/text file to ``{output_json}``. The
-    parser accepts common CAT-V-like fields such as ``model_answer``, ``caption``,
-    ``object_caption``, or a list of event dictionaries.
-    """
-
-    command_template: str
-    model_id: str = "CAT-V"
-    work_root: Path = Path("outputs/egolife_catv_work")
-    visualization_root: Path = Path("outputs/egolife_catv_visualizations")
-    keep_work_dir: bool = False
-    suppress_output: bool = True
-    save_visualizations: bool = True
-    last_metadata: dict[str, Any] = field(default_factory=dict, init=False)
-
-    def __post_init__(self) -> None:
-        if "/path/to/" in self.command_template:
-            raise ValueError(
-                "--catv-command-template still contains the placeholder '/path/to/'. "
-                "Clone/install CAT-V first, then pass the real wrapper script path."
-            )
-        self.command_template = _upgrade_catv_wrapper_template(self.command_template)
-
-    def caption(
-        self,
-        *,
-        video_path: Path,
-        first_frame_path: Path,
-        bbox: dict[str, float],
-        record: dict[str, Any],
-        object_index: int,
-    ) -> str:
-        work_dir = self._record_work_dir(record, object_index)
-        work_dir.mkdir(parents=True, exist_ok=True)
-        if not first_frame_path.exists():
-            timestamp_sec = float(
-                record.get("reference_frame_sec")
-                or record.get("first_frame_sec")
-                or record.get("catv_start_sec")
-                or 0.0
-            )
-            first_frame_path = work_dir / "first_frame.jpg"
-            if _ffmpeg_extract_frame(video_path, first_frame_path, timestamp_sec, force=True) is None:
-                raise FileNotFoundError(
-                    f"Could not extract first frame from {video_path} at {timestamp_sec:.3f}s"
-                )
-        bbox_path = work_dir / "bbox.txt"
-        output_json = work_dir / "catv_caption.json"
-        _write_absolute_bbox(bbox_path, bbox, first_frame_path)
-        target_noun = str((record.get("object") or {}).get("target_noun") or "").strip()
-        object_nouns = target_noun or ",".join(record.get("nouns") or [])
-        values = {
-            "video_path": shlex.quote(str(video_path)),
-            "first_frame_path": shlex.quote(str(first_frame_path)),
-            "bbox_path": shlex.quote(str(bbox_path)),
-            "output_json": shlex.quote(str(output_json)),
-            "work_dir": shlex.quote(str(work_dir)),
-            "object_index": str(object_index),
-            "caption": shlex.quote(object_nouns),
-            "object_nouns": shlex.quote(object_nouns),
-            "start_sec": f"{float(record.get('catv_start_sec') or record.get('start_sec') or 0.0):.3f}",
-            "end_sec": f"{float(record.get('catv_end_sec') or record.get('end_sec') or 0.0):.3f}",
-            "duration_sec": f"{float(record.get('catv_duration_sec') or 5.0):.3f}",
-        }
-        self.last_metadata = {}
-        cmd = self.command_template.format(**values)
-        try:
-            subprocess.run(
-                cmd,
-                shell=True,
-                check=True,
-                capture_output=self.suppress_output,
-                text=self.suppress_output,
-            )
-        except subprocess.CalledProcessError as exc:
-            if not self.keep_work_dir:
-                shutil.rmtree(work_dir, ignore_errors=True)
-            output_tail = _subprocess_output_tail(exc)
-            raise RuntimeError(
-                "CAT-V command failed. Check that the conda env exists, the script path "
-                f"is real, and CAT-V writes {output_json}. Command: {cmd}{output_tail}"
-            ) from exc
-        caption = _read_catv_caption(output_json)
-        if self.save_visualizations:
-            self.last_metadata = self._persist_visualization(output_json, record, object_index)
-        if not self.keep_work_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
-        return caption
-
-    def _record_work_dir(self, record: dict[str, Any], object_index: int) -> Path:
-        group_a, group_b = _record_storage_parts(record)
-        record_id = safe_path_part(str(record.get("id") or record.get("clip_id") or "caption"))
-        return self.work_root / group_a / group_b / f"{record_id}__obj{object_index:03d}"
-
-    def _persist_visualization(
-        self,
-        output_json: Path,
-        record: dict[str, Any],
-        object_index: int,
-    ) -> dict[str, Any]:
-        metadata = _read_json_object(output_json)
-        masked_video_value = str(metadata.get("masked_video") or "").strip()
-        if not masked_video_value:
-            return metadata
-        masked_video = Path(masked_video_value)
-        if not masked_video.exists() or not masked_video.is_file():
-            return metadata
-        group_a, group_b = _record_storage_parts(record)
-        record_id = safe_path_part(str(record.get("id") or record.get("clip_id") or "caption"))
-        dest = self.visualization_root / group_a / group_b / f"{record_id}__obj{object_index:03d}_sam2_mask.mp4"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(masked_video, dest)
-        metadata["sam2_visualization_path"] = str(dest)
-        metadata["catv_masked_video_path"] = str(dest)
-        return metadata
-
-
 _ONE_PASS_DROP_KEYS = {
     "dense_caption",
     "sam2_visualization_path",
@@ -204,6 +66,104 @@ _ONE_PASS_DROP_KEYS = {
     "catv_end_sec",
     "catv_duration_sec",
 }
+# Dropped only from the final written row, not from the in-memory row —
+# _record_storage_parts() still needs participant/day (egolife's adapter
+# uses them to name review-image folders) before this point. participant/day
+# are always null for datasets without that concept (e.g. ego4d) and, where
+# present (egolife), are already recoverable from `id`/`video_path`.
+# frame_selection is a hardcoded constant in this code path — it never
+# actually varies row to row, so it carries no information.
+_ONE_PASS_OUTPUT_ONLY_DROP_KEYS = {
+    "participant",
+    "day",
+    "frame_selection",
+}
+
+
+def _temporal_target_objects_from_sam2_tracking(
+    frame_paths: dict[str, Path],
+    reference_object: dict[str, Any],
+    *,
+    model_id: str,
+    device: str,
+) -> dict[str, Any]:
+    """Propagate the known frame-``t`` bbox backward to t-2/t-1 with SAM-2.
+
+    Runs directly on the three already-extracted sparse frame images (no
+    whole-clip re-decode). A tag is simply omitted if SAM-2 lost the object
+    at that frame; ``_build_temporal_evidence`` degrades gracefully with
+    fewer than 3 frames.
+    """
+    bbox_dict = reference_object.get("bbox") or {}
+    if not bbox_dict:
+        return {}
+    reference_bbox = BBox(
+        x_min=float(bbox_dict.get("x_min") or 0.0),
+        y_min=float(bbox_dict.get("y_min") or 0.0),
+        x_max=float(bbox_dict.get("x_max") or 0.0),
+        y_max=float(bbox_dict.get("y_max") or 0.0),
+    )
+    if reference_bbox.x_max <= reference_bbox.x_min:
+        return {}
+
+    from egoownership.detection.sam2_track import track_bbox_backward
+
+    label = reference_object.get("target_noun") or reference_object.get("label")
+    tracked = track_bbox_backward(
+        frame_paths,
+        reference_bbox,
+        reference_tag="t",
+        model_id=model_id,
+        device=device,
+    )
+    return {
+        tag: {
+            "label": label,
+            "bbox": bbox.model_dump(mode="json"),
+            "source": "sam2_propagated" if tag != "t" else "sam3",
+        }
+        for tag, bbox in tracked.items()
+    }
+
+
+_SAM3_REFINE_CONFIDENCE_FLOOR = 0.5
+
+
+@lru_cache(maxsize=2)
+def _sam3_refine_extractor(model_id: str) -> Sam2ObjectExtractor:
+    from egoownership.sam2_objects import Sam2ObjectConfig
+
+    return Sam2ObjectExtractor(Sam2ObjectConfig(model_id=model_id, backend="sam3"))
+
+
+def _refine_object_bbox_with_sam3(
+    obj: dict[str, Any],
+    frame_t_path: Path,
+    *,
+    model_id: str,
+) -> dict[str, Any] | None:
+    """Re-run SAM-3 on frame ``t`` to refine the target-object bbox.
+
+    Returns the refined object dict, or ``None`` if nothing scored above
+    ``_SAM3_REFINE_CONFIDENCE_FLOOR`` — callers should skip the row in that
+    case, since the original box couldn't be confidently re-grounded.
+    """
+    target_noun = str(obj.get("target_noun") or obj.get("label") or "").strip()
+    if not target_noun:
+        return obj
+    extractor = _sam3_refine_extractor(model_id)
+    candidates = extractor.extract_with_prompt(frame_t_path, target_noun)
+    if not candidates:
+        return None
+    best = candidates[0]
+    if float(best.get("score") or 0.0) <= _SAM3_REFINE_CONFIDENCE_FLOOR:
+        return None
+    return {
+        **obj,
+        "bbox": best["bbox"],
+        "score": best.get("score"),
+        "source": "sam3_refined",
+    }
 
 
 def _caption_describes_target(object_caption: str, target_noun: str) -> bool:
@@ -236,6 +196,9 @@ def write_one_pass_labels(
     frames_dir: Path = Path("outputs/one_pass_sparse_frames"),
     detect_persons: bool = False,
     decision_fn: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    sam3_model_id: str | None = None,
+    sam2_tracking_model_id: str | None = None,
+    sam2_tracking_device: str = "cuda",
     review_dir: Path | None = None,
     review_max_width: int = 900,
     limit: int | None = None,
@@ -250,6 +213,9 @@ def write_one_pass_labels(
         frames_dir=frames_dir,
         detect_persons=detect_persons,
         decision_fn=decision_fn,
+        sam3_model_id=sam3_model_id,
+        sam2_tracking_model_id=sam2_tracking_model_id,
+        sam2_tracking_device=sam2_tracking_device,
         review_dir=review_dir,
         review_max_width=review_max_width,
         limit=limit,
@@ -297,6 +263,9 @@ def _write_one_pass_labels_impl(
     frames_dir: Path,
     detect_persons: bool = False,
     decision_fn: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    sam3_model_id: str | None = None,
+    sam2_tracking_model_id: str | None = None,
+    sam2_tracking_device: str = "cuda",
     review_dir: Path | None = None,
     review_max_width: int = 900,
     limit: int | None = None,
@@ -353,6 +322,7 @@ def _write_one_pass_labels_impl(
     skipped_frame = 0
     skipped_existing = 0
     skipped_caption_mismatch = 0
+    skipped_sam3_low_confidence = 0
     progress_bar = records if show_progress else None
     mode = "a" if resume else "w"
     with out_path.open(mode, encoding="utf-8") as handle:
@@ -384,6 +354,33 @@ def _write_one_pass_labels_impl(
                 _set_progress_postfix(progress_bar, count, skipped_video, skipped_frame, 0, skipped_existing)
                 continue
 
+            target_object = record.get("object") or {}
+            if sam3_model_id:
+                refined = _refine_object_bbox_with_sam3(
+                    target_object, frame_paths["t"], model_id=sam3_model_id
+                )
+                if refined is None:
+                    skipped_sam3_low_confidence += 1
+                    if progress_bar is not None and hasattr(progress_bar, "set_postfix"):
+                        progress_bar.set_postfix(
+                            written=count,
+                            skipped_video=skipped_video,
+                            skipped_frame=skipped_frame,
+                            skipped_existing=skipped_existing,
+                            skipped_sam3_low_conf=skipped_sam3_low_confidence,
+                        )
+                    continue
+                target_object = refined
+
+            temporal_target_objects: dict[str, Any] = {}
+            if sam2_tracking_model_id:
+                temporal_target_objects = _temporal_target_objects_from_sam2_tracking(
+                    frame_paths,
+                    target_object,
+                    model_id=sam2_tracking_model_id,
+                    device=sam2_tracking_device,
+                )
+
             target_frame_sec = frame_times["t"]
             row = {
                 **{k: v for k, v in record.items() if k not in _ONE_PASS_DROP_KEYS},
@@ -395,10 +392,10 @@ def _write_one_pass_labels_impl(
                 "frame_t_minus_2_path": str(frame_paths["t-2"]),
                 "frame_t_minus_1_path": str(frame_paths["t-1"]),
                 "frame_t_path": str(frame_paths["t"]),
-                "temporal_target_objects": {},
+                "temporal_target_objects": temporal_target_objects,
                 "first_frame_path": str(frame_paths["t"]),
                 "first_frame_sec": target_frame_sec,
-                "object": record.get("object") or {},
+                "object": target_object,
                 "source": {
                     **(record.get("source") or {}),
                     "object_description_source": str(descriptions_path),
@@ -425,7 +422,8 @@ def _write_one_pass_labels_impl(
                 review_dest.parent.mkdir(parents=True, exist_ok=True)
                 render_annotation_review_image(labeled_row, max_width=review_max_width).save(review_dest, quality=90)
                 labeled_row["review_image_path"] = str(review_dest)
-            handle.write(json.dumps(labeled_row, ensure_ascii=False) + "\n")
+            output_row = {k: v for k, v in labeled_row.items() if k not in _ONE_PASS_OUTPUT_ONLY_DROP_KEYS}
+            handle.write(json.dumps(output_row, ensure_ascii=False) + "\n")
             handle.flush()
             count += 1
             existing_ids.add(record_id)
@@ -439,6 +437,7 @@ def write_catv_captions_batch(
     *,
     mask_model_path: str = "facebook/sam2.1-hiera-base-plus",
     catv_device: str = "cuda:0",
+    devices: list[str] | None = None,
     fps: float = 1.0,
     whole_video: bool = True,
     max_frames: int = 16,
@@ -455,7 +454,7 @@ def write_catv_captions_batch(
 ) -> int:
     """Batch-mode CAT-V captioning: load SAM-2 once, load the VLM once.
 
-    Instead of spawning run_catv_one_object.py per-row (which reloads both
+    Rather than spawning a fresh process per row (which would reload both
     models every time), this function:
 
     1. Prepares all clip/bbox inputs with ffmpeg (fast, no GPU).
@@ -466,9 +465,6 @@ def write_catv_captions_batch(
     With 183 rows the per-row approach wastes ~1.5h (SAM-2) + ~3h (Qwen3-VL) in
     model I/O alone; batch mode reduces that to a one-time ~90s load.
     """
-    import subprocess as _sp
-    import tempfile
-
     if not input_path.exists():
         raise FileNotFoundError(f"BBox JSONL not found: {input_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -478,14 +474,16 @@ def write_catv_captions_batch(
     sam2_jobs_path = jobs_dir / "sam2_jobs.jsonl"
     vl_jobs_path = jobs_dir / "vl_jobs.jsonl"
 
-    with tempfile.TemporaryDirectory(prefix="catv_batch_work_") as _tmpdir:
-        work_root = Path(_tmpdir)
-        return _write_catv_captions_batch_in_workdir(
+    effective_device = (devices[0] if devices else None) or catv_device
+    work_root = jobs_dir / "work"
+    work_root.mkdir(parents=True, exist_ok=True)
+    return _write_catv_captions_batch_in_workdir(
             input_path=input_path,
             out_path=out_path,
             work_root=work_root,
             mask_model_path=mask_model_path,
-            catv_device=catv_device,
+            catv_device=effective_device,
+            devices=devices,
             fps=fps,
             whole_video=whole_video,
             max_frames=max_frames,
@@ -509,6 +507,7 @@ def _write_catv_captions_batch_in_workdir(
     work_root: Path,
     mask_model_path: str,
     catv_device: str,
+    devices: list[str] | None = None,
     fps: float,
     whole_video: bool,
     max_frames: int,
@@ -532,12 +531,16 @@ def _write_catv_captions_batch_in_workdir(
     if limit is not None:
         records_all = records_all[:limit]
 
+    effective_devices = devices if devices else [catv_device]
+
     if show_progress:
         print(f"[batch_captioning] {len(records_all)} total rows, {len(existing_ids)} already done", flush=True)
 
     # --- Phase 1: Prepare per-row work dirs and write SAM-2 job JSONL ---
     print("[batch_captioning] Phase 1: preparing clips and bbox files …", flush=True)
     sam2_jobs: list[dict[str, Any]] = []
+    # Records whose caption.json already exists from a prior run (skip SAM-2 + VLM).
+    precomputed_jobs: list[dict[str, Any]] = []
     skipped_bad = 0
     skipped_existing = 0
 
@@ -563,6 +566,16 @@ def _write_catv_captions_batch_in_workdir(
         safe_id = safe_path_part(record_id)
         work_dir = work_root / group_a / group_b / safe_id
         work_dir.mkdir(parents=True, exist_ok=True)
+
+        # If caption.json already written by a prior run, skip SAM-2 + VLM.
+        caption_out_json_early = work_dir / "caption.json"
+        if caption_out_json_early.exists() and caption_out_json_early.stat().st_size > 0:
+            precomputed_jobs.append({
+                "job_id": record_id,
+                "out_masked_video": str(work_dir / "sam2_masked.mp4"),
+                "caption_out_json": str(caption_out_json_early),
+            })
+            continue
 
         first_frame_path_str = str(record.get("first_frame_path") or "")
         first_frame_path = Path(first_frame_path_str) if first_frame_path_str else None
@@ -615,8 +628,9 @@ def _write_catv_captions_batch_in_workdir(
 
     if show_progress:
         print(
-            f"[batch_captioning] {len(sam2_jobs)} pending jobs "
-            f"(skipped: {skipped_existing} existing, {skipped_bad} bad rows)",
+            f"[batch_captioning] {len(sam2_jobs)} pending jobs, "
+            f"{len(precomputed_jobs)} already captioned "
+            f"(skipped: {skipped_existing} in output, {skipped_bad} bad rows)",
             flush=True,
         )
 
@@ -630,19 +644,67 @@ def _write_catv_captions_batch_in_workdir(
     )
 
     # --- Phase 2: Run SAM-2 batch tracker ---
-    print(f"[batch_captioning] Phase 2: SAM-2 tracking ({len(sam2_jobs)} jobs) …", flush=True)
+    n_sam2_gpus = len(effective_devices)
+    print(
+        f"[batch_captioning] Phase 2: SAM-2 tracking ({len(sam2_jobs)} jobs, {n_sam2_gpus} GPU(s)) …",
+        flush=True,
+    )
     catv_py = catv_python or qwen_vl_python or sys.executable
     batch_sam2_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_sam2_mask.py"
-    _run_batch_subprocess(
-        [
-            catv_py,
-            str(batch_sam2_script),
-            "--jobs", str(sam2_jobs_path),
-            "--model-path", str(mask_model_path),
-            "--device", catv_device,
-        ],
-        label="batch_sam2_mask",
-    )
+    if n_sam2_gpus == 1:
+        _run_batch_subprocess(
+            [
+                catv_py,
+                str(batch_sam2_script),
+                "--jobs", str(sam2_jobs_path),
+                "--model-path", str(mask_model_path),
+                "--device", effective_devices[0],
+            ],
+            label="batch_sam2_mask",
+            progress_paths=[Path(j["out_masked_video"]) for j in sam2_jobs],
+            progress_desc="Phase 2 SAM-2",
+        )
+    else:
+        import math
+        import threading
+
+        chunk_size = math.ceil(len(sam2_jobs) / n_sam2_gpus)
+        errors: list[Exception] = []
+        threads: list[threading.Thread] = []
+
+        def _run_sam2_shard(shard_jobs: list[dict[str, Any]], device: str, shard_path: Path) -> None:
+            shard_path.write_text(
+                "\n".join(json.dumps(j, ensure_ascii=False) for j in shard_jobs) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                _run_batch_subprocess(
+                    [
+                        catv_py,
+                        str(batch_sam2_script),
+                        "--jobs", str(shard_path),
+                        "--model-path", str(mask_model_path),
+                        "--device", device,
+                    ],
+                    label=f"batch_sam2_mask[{device}]",
+                    progress_paths=[Path(j["out_masked_video"]) for j in shard_jobs],
+                    progress_desc=f"Phase 2 SAM-2 {device}",
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        for i, device in enumerate(effective_devices):
+            shard = sam2_jobs[i * chunk_size: (i + 1) * chunk_size]
+            if not shard:
+                continue
+            shard_path = sam2_jobs_path.parent / f"sam2_jobs_shard{i}.jsonl"
+            t = threading.Thread(target=_run_sam2_shard, args=(shard, device, shard_path), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
 
     # --- Phase 3: Write Qwen3-VL job JSONL for successfully masked rows ---
     print("[batch_captioning] Phase 3: preparing VLM jobs …", flush=True)
@@ -668,24 +730,66 @@ def _write_catv_captions_batch_in_workdir(
 
     # --- Phase 4: Run Qwen3-VL batch captioner ---
     if captioner_backend == "qwen3vl":
-        print(f"[batch_captioning] Phase 4: Qwen3-VL captioning ({len(vl_jobs)} jobs) …", flush=True)
         batch_vl_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_qwen_vl_caption.py"
-        _run_batch_subprocess(
-            [
-                qwen_vl_python or sys.executable,
-                str(batch_vl_script),
-                "--jobs", str(vl_jobs_path),
-                "--model-path", caption_model_path,
-                "--device", catv_device,
-            ],
-            label="batch_qwen_vl_caption",
+        vl_python = qwen_vl_python or sys.executable
+        n_gpus = len(effective_devices)
+        print(
+            f"[batch_captioning] Phase 4: Qwen3-VL captioning ({len(vl_jobs)} jobs, {n_gpus} GPU(s)) …",
+            flush=True,
         )
+        if n_gpus == 1:
+            _run_batch_subprocess(
+                [vl_python, str(batch_vl_script),
+                 "--jobs", str(vl_jobs_path),
+                 "--model-path", caption_model_path,
+                 "--device", effective_devices[0]],
+                label="batch_qwen_vl_caption",
+                progress_paths=[Path(j["out_json"]) for j in vl_jobs],
+                progress_desc="Phase 4 Qwen",
+            )
+        else:
+            import math
+            import threading
+            chunk_size = math.ceil(len(vl_jobs) / n_gpus)
+            errors: list[Exception] = []
+            threads: list[threading.Thread] = []
+
+            def _run_shard(shard_jobs: list[dict], device: str, shard_path: Path) -> None:
+                shard_path.write_text(
+                    "\n".join(json.dumps(j, ensure_ascii=False) for j in shard_jobs) + "\n",
+                    encoding="utf-8",
+                )
+                try:
+                    _run_batch_subprocess(
+                        [vl_python, str(batch_vl_script),
+                         "--jobs", str(shard_path),
+                         "--model-path", caption_model_path,
+                         "--device", device],
+                        label=f"batch_qwen_vl_caption[{device}]",
+                        progress_paths=[Path(j["out_json"]) for j in shard_jobs],
+                        progress_desc=f"Phase 4 Qwen {device}",
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            for i, device in enumerate(effective_devices):
+                shard = vl_jobs[i * chunk_size: (i + 1) * chunk_size]
+                if not shard:
+                    continue
+                shard_path = vl_jobs_path.parent / f"vl_jobs_shard{i}.jsonl"
+                t = threading.Thread(target=_run_shard, args=(shard, device, shard_path), daemon=True)
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join()
+            if errors:
+                raise errors[0]
     else:
         raise NotImplementedError(f"Batch mode not yet implemented for backend: {captioner_backend!r}")
 
     # --- Phase 5: Collect results and write output JSONL ---
     print("[batch_captioning] Phase 5: collecting results …", flush=True)
-    job_by_id = {j["job_id"]: j for j in sam2_jobs}
+    job_by_id = {j["job_id"]: j for j in sam2_jobs + precomputed_jobs}
     record_by_id = {_record_output_id(r): r for r in records_all}
 
     count = 0
@@ -789,106 +893,69 @@ def _probe_video_wh(video_path: Path) -> tuple[int, int]:
     return int(w), int(h)
 
 
-def _run_batch_subprocess(cmd: list[str], *, label: str) -> None:
-    print(f"[{label}] running: {' '.join(cmd)}", flush=True)
+def _run_batch_subprocess(
+    cmd: list[str],
+    *,
+    label: str,
+    quiet: bool = True,
+    progress_paths: list[Path] | None = None,
+    progress_desc: str | None = None,
+) -> None:
+    if not quiet:
+        print(f"[{label}] running: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    tail: deque[str] = deque(maxlen=80)
 
+    def _read_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if quiet:
+                tail.append(line)
+            else:
+                print(line, end="", flush=True)
 
-def write_catv_captions_from_bbox_jsonl(
-    input_path: Path,
-    out_path: Path,
-    *,
-    captioner: ObjectCaptioner,
-    limit: int | None = None,
-    resume: bool = True,
-    show_progress: bool = True,
-) -> int:
-    """Caption existing bbox rows with CAT-V, appending safely on reruns."""
-    if not input_path.exists():
-        raise FileNotFoundError(f"EgoLife bbox JSONL not found: {input_path}")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    import threading
+    import time
 
-    existing_ids: set[str] = set()
-    if resume:
-        existing_ids = _load_existing_output_ids(out_path, repair=True)
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
 
-    records = iter_jsonl(input_path, skip_bad=True)
-    if show_progress:
+    progress_bar = None
+    last_done = 0
+    paths = progress_paths or []
+    if quiet and paths:
         from tqdm.auto import tqdm
 
-        records = tqdm(
-            records,
-            total=count_jsonl(input_path),
-            unit="bbox",
-            desc="CAT-V captioning",
+        last_done = sum(1 for path in paths if path.exists() and path.stat().st_size > 0)
+        progress_bar = tqdm(
+            total=len(paths),
+            initial=last_done,
+            desc=progress_desc or label,
+            unit="job",
+            dynamic_ncols=True,
         )
 
-    count = 0
-    processed = 0
-    skipped_existing = 0
-    skipped_bad_row = 0
-    skipped_error = 0
-    progress_bar = records if show_progress else None
-    mode = "a" if resume else "w"
-    with out_path.open(mode, encoding="utf-8") as handle:
-        for record in records:
-            if limit is not None and processed >= limit:
-                break
-            processed += 1
-            record_id = _record_output_id(record)
-            if record_id in existing_ids:
-                skipped_existing += 1
-                _set_catv_progress_postfix(progress_bar, count, skipped_existing, skipped_bad_row)
-                continue
+    while proc.poll() is None:
+        if progress_bar is not None:
+            done = sum(1 for path in paths if path.exists() and path.stat().st_size > 0)
+            if done > last_done:
+                progress_bar.update(done - last_done)
+                last_done = done
+        time.sleep(2.0)
 
-            video_path = Path(str(record.get("video_path") or ""))
-            first_frame_path = Path(str(record.get("first_frame_path") or ""))
-            obj = record.get("object") or {}
-            bbox = obj.get("bbox") or {}
-            if not video_path.exists() or not bbox:
-                skipped_bad_row += 1
-                _set_catv_progress_postfix(progress_bar, count, skipped_existing, skipped_bad_row)
-                continue
+    reader.join(timeout=2.0)
+    if progress_bar is not None:
+        done = sum(1 for path in paths if path.exists() and path.stat().st_size > 0)
+        if done > last_done:
+            progress_bar.update(done - last_done)
+        progress_bar.close()
 
-            object_index = int(record.get("object_index") or 0)
-            try:
-                object_caption = captioner.caption(
-                    video_path=video_path,
-                    first_frame_path=first_frame_path,
-                    bbox=bbox,
-                    record=record,
-                    object_index=object_index,
-                )
-            except Exception as exc:  # noqa: BLE001
-                skipped_error += 1
-                print(f"[catv_pipeline] skipping {record_id} after captioner error: {exc}", flush=True)
-                _set_catv_progress_postfix(progress_bar, count, skipped_existing, skipped_bad_row)
-                continue
-            catv_metadata = getattr(captioner, "last_metadata", {}) or {}
-            row = {
-                **record,
-                "sam2_visualization_path": catv_metadata.get("sam2_visualization_path")
-                or record.get("sam2_visualization_path"),
-                "catv_masked_video_path": catv_metadata.get("catv_masked_video_path")
-                or record.get("catv_masked_video_path"),
-                "object_caption": object_caption,
-                "source": {
-                    **(record.get("source") or {}),
-                    "captioner": getattr(captioner, "model_id", "CAT-V"),
-                },
-            }
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            handle.flush()
-            existing_ids.add(record_id)
-            count += 1
-            _set_catv_progress_postfix(progress_bar, count, skipped_existing, skipped_bad_row)
-    return count
+    if proc.returncode != 0:
+        if quiet and tail:
+            print(f"[{label}] failed. Last subprocess output:", flush=True)
+            print("".join(tail), end="", flush=True)
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def write_caption_bboxes(
@@ -1109,11 +1176,29 @@ def _description_sparse_frame_times(record: dict[str, Any]) -> dict[str, float]:
 
 
 def _jsonl_sparse_frame_times(record: dict[str, Any]) -> dict[str, float]:
-    """Pick t-2/t-1/t from described_frame_timestamps_sec written by Stage 2.
+    """Pick t-2/t-1/t anchored on the frame the target object was actually
+    detected on.
 
-    Falls back to _description_sparse_frame_times when the field is absent or
-    empty (e.g. records produced by the old per-row caption-bboxes path).
+    ``reference_frame_sec`` (set by the extract-bboxes stage from the SAM-3
+    detection frame) is authoritative: it's what object.bbox, the object
+    caption, and the reference frame image all correspond to. Picking t-2/t-1/t
+    independently from described_frame_timestamps_sec's first/middle/last (the
+    prior approach) can — and empirically does, for ~99.5% of ego4d rows —
+    disagree with reference_frame_sec, silently anchoring the served "t" frame
+    and its bbox on a moment the object was never actually detected at. When a
+    reference frame is available, t-1/t-2 are simply 1s/2s before it.
+
+    Falls back to described_frame_timestamps_sec (then _description_sparse_frame_times)
+    only when no reference_frame_sec is present (e.g. older record formats).
     """
+    reference_sec = record.get("reference_frame_sec")
+    if reference_sec is not None:
+        t0 = round(max(0.0, float(reference_sec)), 3)
+        return {
+            "t-2": round(max(0.0, t0 - 2.0), 3),
+            "t-1": round(max(0.0, t0 - 1.0), 3),
+            "t": t0,
+        }
     timestamps = record.get("described_frame_timestamps_sec")
     if timestamps and len(timestamps) >= 1:
         ts = [float(t) for t in timestamps]
@@ -1255,26 +1340,6 @@ def _record_storage_parts(record: dict[str, Any]) -> tuple[str, str]:
             )
         video_id = safe_path_part(str(record.get("video_id") or "unknown_video"))
         return video_id, "clips"
-
-
-def _upgrade_catv_wrapper_template(template: str) -> str:
-    """Keep older user-provided CAT-V templates aligned with current defaults."""
-    if "run_catv_one_object.py" not in template:
-        return template
-    additions: list[str] = []
-    if "--first-frame" not in template:
-        additions.extend(["--first-frame", "{first_frame_path}"])
-    if "--start-sec" not in template:
-        additions.extend(["--start-sec", "{start_sec}"])
-    if "--duration-sec" not in template and "--whole-video" not in template:
-        additions.extend(["--duration-sec", "{duration_sec}"])
-    if "--fps" not in template:
-        additions.extend(["--fps", "1"])
-    if "--caption" not in template:
-        additions.extend(["--caption", "{object_nouns}"])
-    if not additions:
-        return template
-    return template.rstrip() + " " + " ".join(additions)
 
 
 def extract_first_frame_for_record(
@@ -1719,13 +1784,6 @@ def _bbox_color(index: int) -> tuple[int, int, int]:
     return colors[index % len(colors)]
 
 
-def _write_absolute_bbox(path: Path, bbox: dict[str, float], image_path: Path) -> None:
-    with Image.open(image_path) as image:
-        width, height = image.size
-    x1, y1, x2, y2 = _absolute_bbox_xyxy(bbox, width, height)
-    path.write_text(",".join(map(str, [x1, y1, x2, y2])), encoding="utf-8")
-
-
 def _absolute_bbox_xyxy(bbox: dict[str, float], width: int, height: int) -> tuple[int, int, int, int]:
     x1 = int(float(bbox.get("x_min", 0.0)) * width)
     y1 = int(float(bbox.get("y_min", 0.0)) * height)
@@ -1740,29 +1798,6 @@ def _absolute_bbox_xyxy(bbox: dict[str, float], width: int, height: int) -> tupl
     if y2 < y1:
         y1, y2 = y2, y1
     return x1, y1, x2, y2
-
-
-def _read_catv_caption(path: Path) -> str:
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return ""
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return text
-    return _extract_caption_from_json(data)
-
-
-def _read_json_object(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def _extract_caption_from_json(data: Any) -> str:
@@ -1782,19 +1817,6 @@ def _extract_caption_from_json(data: Any) -> str:
         parts = [part for part in parts if part]
         return "\n".join(parts)
     return ""
-
-
-def _subprocess_output_tail(exc: subprocess.CalledProcessError, *, max_chars: int = 4000) -> str:
-    chunks: list[str] = []
-    stdout = getattr(exc, "stdout", None)
-    stderr = getattr(exc, "stderr", None)
-    if stdout:
-        chunks.append("stdout:\n" + str(stdout)[-max_chars:])
-    if stderr:
-        chunks.append("stderr:\n" + str(stderr)[-max_chars:])
-    if not chunks:
-        return ""
-    return "\n\n" + "\n\n".join(chunks)
 
 
 def _bbox_area(bbox: dict[str, Any]) -> float:
@@ -1828,22 +1850,6 @@ def _set_progress_postfix(
         skipped_frame=skipped_frame,
         skipped_sam=skipped_sam,
         skipped_existing=skipped_existing,
-        refresh=False,
-    )
-
-
-def _set_catv_progress_postfix(
-    progress_bar: Any,
-    written: int,
-    skipped_existing: int,
-    skipped_bad_row: int,
-) -> None:
-    if progress_bar is None or not hasattr(progress_bar, "set_postfix"):
-        return
-    progress_bar.set_postfix(
-        written=written,
-        skipped_existing=skipped_existing,
-        skipped_bad_row=skipped_bad_row,
         refresh=False,
     )
 
@@ -2016,8 +2022,6 @@ def render_annotation_review_image(row: dict[str, Any], *, max_width: int = 900)
     evidence = row.get("evidence") or {}
     cues = evidence.get("caption_cues") or {}
     active_cues = sorted(name for name, value in cues.items() if value)
-    confidence = row.get("auto_confidence")
-    confidence_text = f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "?"
     gt = str(row.get("auto_ground_truth") or "?")
     accent = _REVIEW_GT_COLORS.get(gt, (90, 90, 90))
 
@@ -2029,7 +2033,7 @@ def render_annotation_review_image(row: dict[str, Any], *, max_width: int = 900)
             blocks.append((line, font, color, gap_after))
 
     add_line(f"id: {row.get('id', '?')}", font_small, (110, 110, 110), gap_after=8)
-    title = f"{row.get('auto_taxonomy', '?')} · {gt}  (confidence {confidence_text})"
+    title = f"{row.get('auto_taxonomy', '?')} · {gt}"
     if row.get("needs_review"):
         title += "   ⚠ NEEDS REVIEW"
     add_line(title, font_title, accent, gap_after=8)
@@ -2124,3 +2128,287 @@ def write_annotation_review_images(
 
 
 write_egolife_annotation_review_images = write_annotation_review_images
+
+
+def _build_server_evidence(row: dict[str, Any], stored_evidence: dict[str, Any] | None, obj_label: str, rationale: str) -> dict[str, Any]:
+    from egoownership.catv_evidence_label import _build_key_evidence, _sentence
+
+    stored_evidence = stored_evidence or {}
+    key_evidence = _build_key_evidence(row, stored_evidence, fallback_label=obj_label)
+
+    rationale_paragraph = _sentence(rationale)
+    if not rationale_paragraph:
+        rationale_paragraph = (
+            f"The automatic GT choice is based on the caption evidence, relation graph, "
+            f"object type ({key_evidence['object_type']}), zone ({key_evidence['target_zone']}), "
+            f"and context changes across t-2/t-1/t."
+        )
+    return {**key_evidence, "rationale": rationale_paragraph}
+
+
+def labels_row_to_scene_record(row: dict[str, Any], *, crosscheck: dict[str, Any] | None = None) -> "SceneRecord":
+    """Convert one labels.jsonl row (from one-pass-labels) to a SceneRecord for the server.
+
+    ``crosscheck``, when given, is the matching row from a vlm-crosscheck output
+    file (keyed by the same ``id``) — its independent judge labels/evidence are
+    attached alongside the auto-pipeline's own, never replacing it.
+    """
+    from egoownership.schema import (
+        BBox,
+        ClipCandidate,
+        FrameDetections,
+        ObjectDetection,
+        OwnershipLabel,
+        PersonDetection,
+        Relation,
+        SceneRecord,
+        Taxonomy,
+        VLMJudgement,
+    )
+
+    # ---- timestamps ----
+    frame_times = row.get("frame_times_sec") or {}
+    if isinstance(frame_times, str):
+        try:
+            frame_times = json.loads(frame_times)
+        except Exception:
+            frame_times = {}
+    # `or` would treat a legitimate 0.0 timestamp (e.g. frame t-2 sitting at
+    # the very start of the extraction window) as missing and wrongly fall
+    # through to the next fallback, so check for None explicitly instead.
+    _t2_raw = frame_times.get("t-2")
+    t2 = float(_t2_raw if _t2_raw is not None else (row.get("start_sec") or 0.0))
+    _t1_raw = frame_times.get("t-1")
+    t1 = float(_t1_raw if _t1_raw is not None else t2 + 1.0)
+    _t0_raw = frame_times.get("t")
+    t0 = float(_t0_raw if _t0_raw is not None else (row.get("reference_frame_sec") if row.get("reference_frame_sec") is not None else t1 + 1.0))
+
+    # egolife's cached frame_t/t_minus_1/t_minus_2 JPEGs can predate the most
+    # recent frame_times_sec computation (the on-disk cache is keyed only by
+    # record id + tag, not by timestamp, so a later change to how t-2/t-1/t
+    # are chosen silently leaves old images in place under new, disagreeing
+    # metadata). reference_frame_sec is always kept in sync with the actual
+    # cached frame_t image (it's also what object detection/evidence ran on
+    # — see first_frame_path), and verified-by-inspection to sit exactly 1s/2s
+    # after the cached t-1/t-2 frames, so it's the reliable anchor here. Only
+    # egolife needs this: ego4d's reference_frame_sec means something else and
+    # its frame_times_sec is already correct as-is.
+    if str(row.get("dataset") or row.get("source_dataset") or "") == "egolife":
+        _ref = row.get("reference_frame_sec")
+        if _ref is not None:
+            t0 = float(_ref)
+            t1 = max(0.0, t0 - 1.0)
+            t2 = max(0.0, t0 - 2.0)
+
+    # ---- taxonomy / ownership ----
+    try:
+        taxonomy = Taxonomy(str(row.get("auto_taxonomy") or "D").upper())
+    except ValueError:
+        taxonomy = Taxonomy.AMBIGUOUS
+
+    # Case-insensitive lookup rather than OwnershipLabel(gt_str.upper()) — the
+    # enum's actual value for PERSON_k is mixed-case, so upper-casing the
+    # input before construction would always raise and silently fall back to
+    # AMBIGUOUS for every PERSON_k row.
+    gt_lookup = {label.value.upper(): label for label in OwnershipLabel}
+    ownership = gt_lookup.get(str(row.get("auto_ground_truth") or "").upper(), OwnershipLabel.AMBIGUOUS)
+
+    # ---- evidence strings (shown in server's instance-evidence panel) ----
+    # Re-run the decision function on stored evidence to get up-to-date prose rationale,
+    # even when labels.jsonl was generated by an older version of catv_evidence_label.
+    from egoownership.catv_evidence_label import _sentence
+
+    evidence_strings: list[str] = []
+    stored_evidence = row.get("evidence")
+    rationale = row.get("auto_rationale") or ""
+    if stored_evidence:
+        try:
+            from egoownership.catv_evidence_label import _decide_taxonomy_gt
+            fresh = _decide_taxonomy_gt(row, stored_evidence)
+            rationale = fresh.get("rationale") or rationale
+        except Exception:
+            pass
+    if rationale:
+        evidence_strings.append(_sentence(rationale))
+
+    # ---- object detection ----
+    obj = row.get("object") or {}
+    obj_label = str(obj.get("target_noun") or obj.get("label") or
+                    ((row.get("nouns") or ["object"])[0]))
+
+    temporal_target_objects = row.get("temporal_target_objects") or {}
+
+    def _bbox_from_raw(raw: dict[str, Any]) -> BBox:
+        return BBox(
+            x_min=float(raw.get("x_min", 0.0)),
+            y_min=float(raw.get("y_min", 0.0)),
+            x_max=float(raw.get("x_max", 1.0)),
+            y_max=float(raw.get("y_max", 1.0)),
+        )
+
+    def _object_for_frame(tag: str) -> ObjectDetection:
+        frame_obj = temporal_target_objects.get(tag) if isinstance(temporal_target_objects, dict) else None
+        if not isinstance(frame_obj, dict):
+            frame_obj = obj
+        raw_bbox = frame_obj.get("bbox") or obj.get("bbox") or {}
+        return ObjectDetection(
+            label=str(frame_obj.get("target_noun") or frame_obj.get("label") or obj_label),
+            bbox=_bbox_from_raw(raw_bbox),
+            score=frame_obj.get("score"),
+            instance_id="obj_0",
+            ownership=ownership,
+            ownership_evidence=evidence_strings,
+        )
+
+    def _objects_for_frame(tag: str) -> list[ObjectDetection]:
+        frame_obj = temporal_target_objects.get(tag) if isinstance(temporal_target_objects, dict) else None
+        if tag != "t" and not isinstance(frame_obj, dict):
+            # No genuine tracked bbox at t-2/t-1 (SAM-2 tracking lost the
+            # object) — don't draw frame t's box here instead, since that
+            # would misleadingly suggest we know the object sat in that exact
+            # spot at an earlier moment we actually have no data for.
+            return []
+        candidate = _object_for_frame(tag)
+        if tag != "t" and candidate.bbox == _object_for_frame("t").bbox:
+            # Belt-and-suspenders: even with genuine tracked data, an
+            # earlier-frame box identical to frame t's is not extra evidence —
+            # skip drawing the duplicate.
+            return []
+        return [candidate]
+
+    # ---- persons/relations/zones per frame (for the "show zones"/"show
+    # relations" toggles — previously always empty since nothing populated
+    # them here, even though the client-side rendering code was correct) ----
+    from egoownership.config import load_config
+    from egoownership.detection.zones import person_relative_zones, static_zones
+
+    _cfg = load_config()
+    _frame_snapshots = (stored_evidence or {}).get("temporal", {}).get("frame_snapshots") or {}
+
+    def _remap_relation_id(value: str) -> str:
+        # Stored relations use "target" as the sentinel subject id; frame
+        # objects here use "obj_0" (see _object_for_frame) — remap so the
+        # client's bbox lookup by instance_id actually matches.
+        return "obj_0" if value == "target" else value
+
+    def _frame_extras(tag: str) -> tuple[list["PersonDetection"], list["Relation"], Any]:
+        snapshot = _frame_snapshots.get(tag) or {}
+        raw_persons = snapshot.get("persons") or []
+        raw_relations = snapshot.get("relations") or []
+        if not snapshot and tag == "t":
+            # No temporal tracking for this row (--sam2-track wasn't used) —
+            # fall back to the top-level (t-only) relations captured at
+            # generation time. Persons/zones aren't persisted outside the
+            # temporal block, so those stay empty for this fallback case.
+            raw_relations = (stored_evidence or {}).get("relations") or []
+
+        persons = [
+            PersonDetection(bbox=BBox(**p["bbox"]), person_id=p.get("person_id"), score=p.get("score"))
+            for p in raw_persons
+            if isinstance(p, dict) and p.get("bbox")
+        ]
+        relations = [
+            Relation(
+                subject_id=_remap_relation_id(str(r.get("subject_id") or "")),
+                object_id=_remap_relation_id(str(r.get("object_id") or "")),
+                predicate=str(r.get("predicate") or "related_to"),
+                score=r.get("score"),
+                note=r.get("note"),
+            )
+            for r in raw_relations
+            if isinstance(r, dict)
+        ]
+        zones = person_relative_zones(persons, _cfg.zones) if persons else static_zones(_cfg.zones)
+        return persons, relations, zones
+
+    # ---- frames ----
+    frame_paths = {
+        "t-2": row.get("frame_t_minus_2_path"),
+        "t-1": row.get("frame_t_minus_1_path"),
+        "t":   row.get("frame_t_path"),
+    }
+    times = {"t-2": t2, "t-1": t1, "t": t0}
+    frames = []
+    for tag in ("t-2", "t-1", "t"):
+        persons, relations, zones = _frame_extras(tag)
+        frames.append(
+            FrameDetections(
+                tag=tag,
+                frame_path=frame_paths.get(tag),
+                timestamp_sec=times[tag],
+                objects=_objects_for_frame(tag),
+                persons=persons,
+                relations=relations,
+                zones=zones,
+            )
+        )
+
+    # ---- nouns ----
+    nouns = row.get("nouns") or []
+    if isinstance(nouns, str):
+        try:
+            nouns = json.loads(nouns)
+        except Exception:
+            nouns = [nouns]
+
+    # ---- structured evidence (for editable UI panel) ----
+    auto_key_evidence: dict[str, Any] = {}
+    if stored_evidence:
+        auto_key_evidence = _build_server_evidence(row, stored_evidence, obj_label, rationale)
+
+    # Strip leading slash so the path becomes a clean URL segment for /video/{path}.
+    _video_id = str(row.get("video_path") or row.get("video_id") or "").lstrip("/")
+
+    review_clip_id = str(row.get("id") or row.get("clip_id") or "")
+    base_clip_id = str(row.get("clip_id") or row.get("video_id") or "")
+
+    clip = ClipCandidate(
+        dataset=str(row.get("dataset") or row.get("source_dataset") or "unknown"),
+        clip_id=review_clip_id,
+        video_id=_video_id,
+        taxonomy=taxonomy,
+        t_minus_2_sec=t2,
+        t_minus_1_sec=t1,
+        t_sec=t0,
+        verb=str(row.get("verb") or ""),
+        nouns=nouns if isinstance(nouns, list) else [],
+        narration=str(row.get("dense_caption_en") or row.get("transcript") or ""),
+        source={"base_clip_id": base_clip_id, "label_row_id": review_clip_id},
+    )
+
+    # ---- vlm-crosscheck (independent judge second opinion, when provided) ----
+    vlm_judgements: dict[str, "VLMJudgement"] = {}
+    vlm_agreement_ratio: float | None = None
+    vlm_majority_label: OwnershipLabel | None = None
+    if crosscheck:
+        for model_id, judge_result in (crosscheck.get("judges") or {}).items():
+            if not isinstance(judge_result, dict):
+                continue
+            judge_label = gt_lookup.get(str(judge_result.get("label") or "").upper())
+            if judge_label is None:
+                continue
+            vlm_judgements[model_id] = VLMJudgement(
+                model_id=model_id,
+                label=judge_label,
+                agrees=judge_result.get("agrees"),
+                object_type_evidence=judge_result.get("object_type_evidence") or None,
+                zone_evidence=judge_result.get("zone_evidence") or None,
+                relation_graph_evidence=judge_result.get("relation_graph_evidence") or None,
+                context_change_evidence=judge_result.get("context_change_evidence") or None,
+                rationale=judge_result.get("raw_response") or None,
+            )
+        vlm_agreement_ratio = crosscheck.get("agreement_ratio")
+        vlm_majority_label = gt_lookup.get(str(crosscheck.get("majority_label") or "").upper())
+
+    return SceneRecord(
+        clip=clip,
+        frames=frames,
+        scene_label=ownership,
+        scene_taxonomy=taxonomy,
+        auto_label_confidence=None,
+        auto_key_evidence=auto_key_evidence,
+        review_status="draft",
+        vlm_judgements=vlm_judgements,
+        vlm_agreement_ratio=vlm_agreement_ratio,
+        vlm_majority_label=vlm_majority_label,
+    )

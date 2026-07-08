@@ -86,7 +86,7 @@ def detect_objects(
 
     detections: list[ObjectDetection] = []
     for box, score, label in zip(
-        results["boxes"].tolist(), results["scores"].tolist(), results["labels"]
+        results["boxes"].tolist(), results["scores"].tolist(), results["text_labels"]
     ):
         x1, y1, x2, y2 = box
         detections.append(

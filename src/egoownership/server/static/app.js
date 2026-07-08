@@ -44,6 +44,7 @@ const els = {
   sceneLabelButtons: $("scene-label-buttons"),
   taxonomyButtons: $("taxonomy-buttons"),
   statusButtons: $("status-buttons"),
+  evidencePanel: $("evidence-panel"),
   notes: $("notes"),
   save: $("save"),
   prev: $("prev"),
@@ -59,9 +60,11 @@ const els = {
   nEdits: $("n-edits"),
   activityList: $("activity-list"),
   refresh: null,
+  filterDataset: $("filter-dataset"),
   filterStatus: $("filter-status"),
   filterTaxonomy: $("filter-taxonomy"),
   filterLabel: $("filter-label"),
+  filterVlmAgreement: $("filter-vlm-agreement"),
   filterSort: $("filter-sort"),
   search: $("search"),
   annotator: $("annotator"),
@@ -84,6 +87,9 @@ const els = {
   statsStatus: $("stats-status"),
   statsLabel: $("stats-label"),
   statsTaxonomy: $("stats-taxonomy"),
+  statsVlm: $("stats-vlm"),
+  vlmBadge: $("vlm-badge"),
+  vlmPanel: $("vlm-panel"),
 };
 
 // ---- preference persistence ----
@@ -105,15 +111,31 @@ async function bootstrap() {
   } catch (e) {
     console.warn("config failed", e);
   }
+  await loadDatasets();
   await refreshSidebar();
 }
 
 // ---- scenes list ----
+async function loadDatasets() {
+  try {
+    const datasets = await fetchJSON("/api/datasets");
+    if (datasets.length <= 1) return; // nothing to filter — single dataset (or none) being served
+    const current = els.filterDataset.value;
+    els.filterDataset.innerHTML = `<option value="">all</option>` +
+      datasets.map((d) => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join("");
+    els.filterDataset.value = current;
+  } catch (e) {
+    console.warn("datasets failed", e);
+  }
+}
+
 async function loadScenes() {
   const params = new URLSearchParams();
+  if (els.filterDataset.value) params.set("dataset", els.filterDataset.value);
   if (els.filterStatus.value) params.set("status", els.filterStatus.value);
   if (els.filterTaxonomy.value) params.set("taxonomy", els.filterTaxonomy.value);
   if (els.filterLabel.value) params.set("label", els.filterLabel.value);
+  if (els.filterVlmAgreement.value) params.set("vlm_agreement", els.filterVlmAgreement.value);
   if (els.filterSort.value) params.set("sort", els.filterSort.value);
   state.scenes = await fetchJSON(`/api/scenes?${params}`);
   renderScenes();
@@ -133,6 +155,9 @@ function renderScenes() {
       if (state.active && state.active.clip.clip_id === s.clip_id) li.classList.add("active");
       const conf = s.auto_label_confidence;
       const confClass = conf == null ? "" : conf < 0.4 ? "low" : conf < 0.75 ? "med" : "high";
+      const vlmPill = s.has_vlm_judgement
+        ? `<span class="vlm-pill ${s.vlm_agrees ? 'agree' : 'disagree'}" title="VLM cross-check ${s.vlm_agrees ? 'agrees' : 'disagrees'}">${s.vlm_agrees ? '✓' : '✗'} vlm</span>`
+        : '';
       li.innerHTML = `
         <div class="row">
           <span class="clip-id" title="${escapeHtml(s.clip_id)}">${escapeHtml(s.clip_id)}</span>
@@ -144,6 +169,7 @@ function renderScenes() {
         </div>
         <div class="row">
           <small>tax ${s.taxonomy} · ${s.n_objects} objs${s.n_edits ? ' · ' + s.n_edits + ' edits' : ''}</small>
+          ${vlmPill}
           <span class="conf-mini ${confClass}">${conf != null ? conf.toFixed(2) : '—'}</span>
         </div>`;
       li.onclick = () => loadScene(s.clip_id);
@@ -173,7 +199,7 @@ async function checkVideoAvailability() {
   state.videoPresent = false;
   if (!state.config.videos_available || !state.active?.clip?.video_id) return;
   try {
-    const head = await fetch(`/video/${encodeURIComponent(state.active.clip.video_id)}`, { method: "HEAD" });
+    const head = await fetch(`/video/${state.active.clip.video_id}`, { method: "HEAD" });
     state.videoPresent = head.ok;
   } catch {
     state.videoPresent = false;
@@ -195,9 +221,13 @@ function renderActive() {
   els.taxonomyBadge.textContent = `Tax ${state.edits.scene_taxonomy}`;
   els.statusBadge.textContent = state.edits.review_status;
   els.statusBadge.className = `badge status-badge ${state.edits.review_status}`;
-  const conf = r.auto_label_confidence;
-  els.confBadge.textContent = conf != null ? `auto ${conf.toFixed(2)}` : "";
-  els.confBadge.className = `badge conf-badge ${conf != null && conf < 0.5 ? "low" : ""}`;
+  els.confBadge.hidden = true;
+  els.vlmBadge.hidden = !r.vlm_majority_label;
+  if (r.vlm_majority_label) {
+    const vlmAgrees = r.vlm_majority_label === r.scene_label;
+    els.vlmBadge.textContent = vlmAgrees ? "VLM: agrees" : "VLM: disagrees";
+    els.vlmBadge.className = `badge vlm-badge ${vlmAgrees ? "agree" : "disagree"}`;
+  }
   els.dirtyBadge.hidden = !state.dirty;
   els.lastSaved.textContent = state.lastSaved ? `last save · ${state.lastSaved}` : "";
 
@@ -209,6 +239,8 @@ function renderActive() {
   renderSegButtons(els.sceneLabelButtons, LABELS, state.edits.scene_label, (v) => setSceneLabel(v));
   renderSegButtons(els.taxonomyButtons, TAXONOMIES, state.edits.scene_taxonomy, (v) => { state.edits.scene_taxonomy = v; markDirty(); renderActive(); });
   renderSegButtons(els.statusButtons, STATUSES, state.edits.review_status, (v) => { state.edits.review_status = v; markDirty(); renderActive(); });
+  renderEvidencePanel(r);
+  renderVlmPanel(r);
   els.notes.value = state.edits.notes || "";
   els.notes.oninput = () => { state.edits.notes = els.notes.value; markDirty(); };
 
@@ -248,8 +280,9 @@ function renderVideoBlock(r) {
     return;
   }
   els.videoBlock.hidden = false;
-  const url = `/video/${encodeURIComponent(r.clip.video_id)}`;
-  if (els.clipVideo.src.split("/").pop() !== encodeURIComponent(r.clip.video_id)) {
+  const url = `/video/${r.clip.video_id}`;
+  if (els.clipVideo.getAttribute("data-video-id") !== r.clip.video_id) {
+    els.clipVideo.setAttribute("data-video-id", r.clip.video_id);
     els.clipVideo.src = url;
   }
   // Pre-seek to t-2 so the annotator sees the start of the clip.
@@ -309,7 +342,7 @@ function drawFrame(canvas, legend, frame) {
       });
     }
     (frame.objects || []).forEach((o) => {
-      const ownColor = COLORS[o.ownership] || "#3b82f6";
+      const ownColor = COLORS[o.ownership] || "#6b7280";
       const insColor = instanceColor(o.instance_id);
       // Outer thin box = instance color, inner thick box = ownership color.
       drawBox(ctx, o.bbox, W, H, insColor, 1, false, "");
@@ -324,7 +357,7 @@ function drawFrame(canvas, legend, frame) {
     legend.innerHTML = "";
     (frame.persons || []).forEach((p) => legend.appendChild(chip("#ffffff", `${p.person_id || "person"}`, true)));
     (frame.objects || []).forEach((o) => {
-      const c = COLORS[o.ownership] || "#3b82f6";
+      const c = COLORS[o.ownership] || "#6b7280";
       const labelStr = `${o.label}${o.instance_id ? '·' + o.instance_id : ''}${o.ownership ? ' ' + o.ownership : ''}`;
       legend.appendChild(chip(c, labelStr, false));
     });
@@ -469,6 +502,319 @@ function chip(color, text, dashed) {
   return span;
 }
 
+const OBJECT_TYPES = ["personal", "shared", "generic_object"];
+const TARGET_ZONES = ["ego_zone", "other_person_zone", "shared_zone", "center_table", "background_or_ambiguous_zone"];
+
+// The 4 aspects the VLM judge shares with the auto evidence panel (it has no
+// equivalent of "1. caption"), keyed by the field name both sides use.
+// Ordered to match the auto evidence panel's numbering (2-5) so the two
+// panels line up row-for-row when eyeballed side-by-side.
+const VLM_SHARED_ASPECTS = [
+  ["relation_graph", "relation_graph_evidence"],
+  ["object_type", "object_type_evidence"],
+  ["zone", "zone_evidence"],
+  ["context_change", "context_change_evidence"],
+];
+
+function vlmCompositeKey(modelId, shortKey) { return `vlm::${modelId}::${shortKey}`; }
+
+function vlmEvidenceTextForKey(r, compositeKey) {
+  const [, modelId, shortKey] = compositeKey.split("::");
+  const judge = (r.vlm_judgements || {})[modelId];
+  const field = (VLM_SHARED_ASPECTS.find(([k]) => k === shortKey) || [])[1];
+  return (judge && field && judge[field]) || "";
+}
+
+// Default rationale suggestion: for each aspect where a VLM judge's overall
+// label *agrees* with the auto label and both sides actually wrote something
+// for that aspect, treat it as corroborated by two independent modes and
+// pre-select it (both the auto checkbox and the matching VLM checkbox).
+// Only applies when nobody has already curated a selection for this row —
+// an existing kev.selected_evidence means a human already made this call.
+function computeDualSupportedDefault(r) {
+  const kev = r.auto_key_evidence || {};
+  if ((kev.selected_evidence || []).length) return null;
+  const autoKeys = [];
+  const vlmKeys = [];
+  const sentences = [];
+  Object.entries(r.vlm_judgements || {}).forEach(([modelId, judge]) => {
+    if (judge.agrees !== true) return;
+    VLM_SHARED_ASPECTS.forEach(([shortKey, field]) => {
+      const autoText = kev[field];
+      const vlmText = judge[field];
+      if (autoText && vlmText) {
+        autoKeys.push(shortKey);
+        vlmKeys.push(vlmCompositeKey(modelId, shortKey));
+        sentences.push(autoText, vlmText);
+      }
+    });
+  });
+  if (!sentences.length) return null;
+  return { autoKeys, vlmKeys, text: Array.from(new Set(sentences)).join(" ") };
+}
+
+function renderEvidencePanel(r) {
+  const kev = r.auto_key_evidence || {};
+  if (!els.evidencePanel) return;
+
+  const evidenceRows = [
+    ["caption", "1. caption", kev.caption_evidence || "—", false],
+    ["relation_graph", "2. relation graph", relationGraphControl(kev), true],
+    ["object_type", "3. object type", objectTypeControl(kev), true],
+    ["zone", "4. zone information", zoneControl(kev), true],
+    ["context_change", "5. context change", kev.context_change_evidence || "—", false],
+  ];
+  const suggestion = computeDualSupportedDefault(r);
+  const selected = new Set(kev.selected_evidence && kev.selected_evidence.length ? kev.selected_evidence : (suggestion ? suggestion.autoKeys : []));
+  const initialRationale = (kev.selected_evidence && kev.selected_evidence.length) || !suggestion ? (kev.rationale || "") : suggestion.text;
+
+  els.evidencePanel.innerHTML = `
+    <div class="evidence-rationale">
+      <div class="evidence-title">Auto rationale for GT choice${suggestion ? ' <small class="hint">(defaulted to evidence both auto + VLM support)</small>' : ""}</div>
+      <textarea class="evidence-rationale-text" rows="4">${escapeHtml(initialRationale)}</textarea>
+      <div class="evidence-actions">
+        <button type="button" class="add-selected-evidence">add selected evidence</button>
+        <button type="button" class="save-rationale">save rationale</button>
+        <span class="evidence-save-feedback"></span>
+      </div>
+    </div>
+    <div class="evidence-list">
+      ${evidenceRows.map(([key, title, body, isHtml]) => `
+        <div class="evidence-item">
+          <label class="evidence-check">
+            <input type="checkbox" data-evidence-key="${escapeHtml(key)}"${selected.has(key) ? " checked" : ""} />
+            <span>${escapeHtml(title)}</span>
+          </label>
+          <div class="evidence-body">${isHtml ? body : escapeHtml(body)}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+
+  const rationaleText = els.evidencePanel.querySelector(".evidence-rationale-text");
+  const feedback = els.evidencePanel.querySelector(".evidence-save-feedback");
+  const selectedKeys = () => [
+    ...Array.from(els.evidencePanel.querySelectorAll("[data-evidence-key]:checked")).map((x) => x.dataset.evidenceKey),
+    ...Array.from(els.vlmPanel ? els.vlmPanel.querySelectorAll("[data-vlm-evidence-key]:checked") : []).map((x) => x.dataset.vlmEvidenceKey),
+  ];
+
+  els.evidencePanel.querySelector(".add-selected-evidence").onclick = () => {
+    const additions = selectedKeys()
+      .map((key) => (key.startsWith("vlm::") ? vlmEvidenceTextForKey(r, key) : evidenceTextForKey(kev, key)))
+      .filter(Boolean);
+    if (!additions.length) return;
+    const current = (rationaleText.value || "").trim();
+    const addition = additions.join(" ");
+    rationaleText.value = current ? `${current} ${addition}` : addition;
+  };
+
+  els.evidencePanel.querySelector(".save-rationale").onclick = async () => {
+    const payload = {
+      annotator: els.annotator.value || "anonymous",
+      rationale: rationaleText.value || "",
+      selected_evidence: selectedKeys(),
+    };
+    feedback.textContent = "saving…";
+    try {
+      const updated = await fetchJSON(
+        `/api/scenes/${encodeURIComponent(r.clip.clip_id)}/evidence`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
+      );
+      state.active = updated;
+      state.lastSaved = new Date().toLocaleTimeString();
+      feedback.textContent = "saved";
+      renderActive();
+      refreshSidebar();
+    } catch (e) {
+      feedback.textContent = `error: ${e.message || e}`;
+      console.error("rationale update failed", e);
+    }
+  };
+
+  els.evidencePanel.querySelectorAll(".ev-select").forEach((sel) => {
+    sel.onchange = async () => {
+      const evKey = sel.dataset.evKey;
+      const payload = { annotator: els.annotator.value || "anonymous", [evKey]: sel.value };
+      try {
+        const updated = await fetchJSON(
+          `/api/scenes/${encodeURIComponent(r.clip.clip_id)}/evidence`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
+        );
+        state.active = updated;
+        state.lastSaved = new Date().toLocaleTimeString();
+        renderActive();
+        refreshSidebar();
+      } catch (e) {
+        console.error("evidence update failed", e);
+      }
+    };
+  });
+
+  const postRelations = async (newRelations) => {
+    const payload = { annotator: els.annotator.value || "anonymous", relations: newRelations };
+    try {
+      const updated = await fetchJSON(
+        `/api/scenes/${encodeURIComponent(r.clip.clip_id)}/evidence`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
+      );
+      state.active = updated;
+      state.lastSaved = new Date().toLocaleTimeString();
+      renderActive();
+      refreshSidebar();
+    } catch (e) {
+      console.error("relation update failed", e);
+    }
+  };
+
+  els.evidencePanel.querySelectorAll(".relation-remove").forEach((btn) => {
+    btn.onclick = () => postRelations((kev.relations || []).filter((_, i) => i !== Number(btn.dataset.relIdx)));
+  });
+
+  els.evidencePanel.querySelectorAll(".relation-reassign").forEach((sel) => {
+    sel.onchange = () => {
+      const idx = Number(sel.dataset.relIdx);
+      if (sel.value === RELATION_REMOVE_SENTINEL) {
+        postRelations((kev.relations || []).filter((_, i) => i !== idx));
+        return;
+      }
+      const newRelations = (kev.relations || []).map((rel, i) =>
+        i === idx ? { ...rel, object_id: sel.value, note: "manually corrected", score: null } : rel
+      );
+      postRelations(newRelations);
+    };
+  });
+}
+
+// Side-by-side with the auto evidence panel, not merged into it — the whole
+// point of vlm-crosscheck is an *independent* second opinion, so reconciling
+// disagreeing rationales is left to the human reviewer, not blended here.
+// Row labels intentionally match the auto evidence panel's numbering (2-5;
+// the VLM judge has no equivalent of "1. caption") so the two are easy to
+// eyeball side-by-side.
+const VLM_ASPECT_TITLES = {
+  relation_graph: "2. relation graph",
+  object_type: "3. object type",
+  zone: "4. zone information",
+  context_change: "5. context change",
+};
+
+function renderVlmPanel(r) {
+  if (!els.vlmPanel) return;
+  const judgements = r.vlm_judgements || {};
+  const modelIds = Object.keys(judgements);
+  if (!modelIds.length) {
+    els.vlmPanel.innerHTML = `<div class="vlm-empty">No VLM cross-check judgement available for this clip yet.</div>`;
+    return;
+  }
+  const kev = r.auto_key_evidence || {};
+  const suggestion = computeDualSupportedDefault(r);
+  const priorSelection = kev.selected_evidence || [];
+  const selected = new Set(priorSelection.length ? priorSelection : (suggestion ? suggestion.vlmKeys : []));
+
+  els.vlmPanel.innerHTML = modelIds.map((modelId) => {
+    const j = judgements[modelId];
+    const agreeClass = j.agrees == null ? "" : j.agrees ? "agree" : "disagree";
+    const agreeText = j.agrees == null ? "no auto label to compare" : j.agrees ? "✓ agrees" : "✗ disagrees";
+    const rows = VLM_SHARED_ASPECTS.map(([shortKey, field]) => {
+      const compositeKey = vlmCompositeKey(modelId, shortKey);
+      return `
+        <div class="evidence-item">
+          <label class="evidence-check">
+            <input type="checkbox" data-vlm-evidence-key="${escapeHtml(compositeKey)}"${selected.has(compositeKey) ? " checked" : ""} />
+            <span class="vlm-evidence-title">${escapeHtml(VLM_ASPECT_TITLES[shortKey])}</span>
+          </label>
+          <div class="evidence-body">${escapeHtml(j[field] || "—")}</div>
+        </div>
+      `;
+    }).join("");
+    const fallback = !j.object_type_evidence && !j.zone_evidence && !j.relation_graph_evidence && !j.context_change_evidence && j.rationale
+      ? `<div class="evidence-item"><span class="vlm-evidence-title">raw response</span><div class="evidence-body">${escapeHtml(j.rationale)}</div></div>`
+      : "";
+    return `
+      <div class="vlm-judge-card">
+        <div class="vlm-judge-header">
+          <span class="vlm-model-id">${escapeHtml(modelId)}</span>
+          <span class="label-pill ${j.label || 'UNLABELED'}">${escapeHtml(j.label || '—')}</span>
+          <span class="vlm-agree-pill ${agreeClass}">${agreeText}</span>
+        </div>
+        <div class="evidence-list">${rows}${fallback}</div>
+      </div>
+    `;
+  }).join("");
+}
+
+function evidenceTextForKey(kev, key) {
+  if (key === "caption") return kev.caption_evidence || "";
+  if (key === "relation_graph") return kev.relation_graph_evidence || "";
+  if (key === "object_type") return kev.object_type_evidence || (kev.object_type ? `The object type is ${kev.object_type}.` : "");
+  if (key === "zone") return kev.zone_evidence || (kev.target_zone ? `The object is in ${kev.target_zone}.` : "");
+  if (key === "context_change") return kev.context_change_evidence || "";
+  return "";
+}
+
+function objectTypeControl(kev) {
+  return `
+    <select class="ev-select" data-ev-key="object_type">
+      ${OBJECT_TYPES.map((t) => `<option value="${escapeHtml(t)}"${kev.object_type === t ? " selected" : ""}>${escapeHtml(t)}</option>`).join("")}
+    </select>
+    <span class="ev-inline-text">${escapeHtml(kev.object_type_evidence || "")}</span>
+  `;
+}
+
+function zoneControl(kev) {
+  return `
+    <select class="ev-select" data-ev-key="target_zone">
+      ${TARGET_ZONES.map((z) => `<option value="${escapeHtml(z)}"${kev.target_zone === z ? " selected" : ""}>${escapeHtml(z)}</option>`).join("")}
+    </select>
+    <span class="ev-inline-text">${escapeHtml(kev.zone_evidence || "")}</span>
+  `;
+}
+
+function relationText(rel) {
+  const parts = [`${rel.predicate || "related_to"} → ${rel.object_id || "unknown"}`];
+  if (rel.note) parts.push(`(${rel.note})`);
+  if (rel.score != null) parts.push(`score=${Number(rel.score).toFixed(2)}`);
+  return parts.join(" ");
+}
+
+const RELATION_REMOVE_SENTINEL = "__remove__";
+
+// Every holder id ever seen for this target across t-2/t-1/t, so a reviewer
+// can reassign a held_by relation (e.g. person_5 -> wearer) instead of only
+// being able to delete it and hope some other tier lands on the right answer.
+function holderOptionsFor(kev) {
+  const ids = new Set(["wearer"]);
+  const snapshots = (kev.temporal && kev.temporal.frame_snapshots) || {};
+  Object.values(snapshots).forEach((snap) => {
+    (snap.persons || []).forEach((p) => { if (p.person_id) ids.add(p.person_id); });
+  });
+  return Array.from(ids);
+}
+
+function relationGraphControl(kev) {
+  const relations = kev.relations || [];
+  const summary = `<div class="ev-inline-text">${escapeHtml(kev.relation_graph_evidence || "No relations recorded.")}</div>`;
+  if (!relations.length) return summary;
+  const holderOptions = holderOptionsFor(kev);
+  const rows = relations.map((rel, idx) => {
+    const reassign = rel.predicate === "held_by" ? `
+      <select class="relation-reassign" data-rel-idx="${idx}" title="Reassign this relation's holder, or remove it">
+        ${holderOptions.map((id) => `<option value="${escapeHtml(id)}"${rel.object_id === id ? " selected" : ""}>${escapeHtml(id)}</option>`).join("")}
+        <option value="${RELATION_REMOVE_SENTINEL}">— remove —</option>
+      </select>
+    ` : `
+      <button type="button" class="relation-remove" data-rel-idx="${idx}" title="Remove this relation">remove</button>
+    `;
+    return `
+      <div class="relation-row">
+        <span class="relation-text">${escapeHtml(relationText(rel))}</span>
+        ${reassign}
+      </div>
+    `;
+  }).join("");
+  return `${summary}<div class="relation-list">${rows}</div>`;
+}
+
 // ---- per-instance review panel ----
 function renderInstances(r) {
   const groups = {};
@@ -488,17 +834,11 @@ function renderInstances(r) {
     if (overrideLabel) card.classList.add("dirty");
     const finalDet = g.byTag["t"] || g.byTag["t-1"] || g.byTag["t-2"];
     const finalOwnership = overrideLabel || finalDet?.ownership || "—";
-    const evidenceList = ["t-2", "t-1", "t"]
-      .map((tag) => g.byTag[tag])
-      .filter(Boolean)
-      .flatMap((d) => (d.ownership_evidence || []).map((e) => `${e}`))
-      .filter((v, i, a) => a.indexOf(v) === i)
-      .join(" · ");
 
     const dotsHtml = ["t-2", "t-1", "t"].map((tag) => {
       const d = g.byTag[tag];
       const cls = d ? (d.ownership || "AMBIGUOUS") : "absent";
-      return `<span class="frame-dot ${cls}" title="${tag} · ${d ? d.ownership || '—' : 'not detected'}">${tag.replace("t", "t").replace("-", "−")}</span>`;
+      return `<span class="frame-dot ${cls}" title="${tag} · ${d ? d.ownership || '—' : 'not detected'}">${tag.replace("-", "−")}</span>`;
     }).join("");
 
     card.innerHTML = `
@@ -510,23 +850,24 @@ function renderInstances(r) {
       </div>
       <div class="instance-frames">${dotsHtml}</div>
       <div class="instance-override"></div>
-      ${evidenceList ? `<div class="instance-evidence">${escapeHtml(evidenceList)}</div>` : ""}
     `;
-    const sel = document.createElement("select");
+
+    const overrideSel = document.createElement("select");
     ["", ...LABELS].forEach((lbl) => {
       const opt = document.createElement("option");
       opt.value = lbl;
       opt.textContent = lbl || "(keep auto)";
       if ((overrideLabel || "") === lbl) opt.selected = true;
-      sel.appendChild(opt);
+      overrideSel.appendChild(opt);
     });
-    sel.onchange = () => {
-      if (sel.value) state.edits.object_overrides[g.id] = sel.value;
+    overrideSel.onchange = () => {
+      if (overrideSel.value) state.edits.object_overrides[g.id] = overrideSel.value;
       else delete state.edits.object_overrides[g.id];
       markDirty();
       renderInstances(r);
     };
-    card.querySelector(".instance-override").appendChild(sel);
+    card.querySelector(".instance-override").appendChild(overrideSel);
+
     els.instancesGrid.appendChild(card);
   });
   els.nInstances.textContent = list.length;
@@ -684,6 +1025,7 @@ async function loadStats() {
   renderBucket(els.statsStatus, s.by_status, (k) => `status-pill ${k}`);
   renderBucket(els.statsLabel, s.by_label, (k) => `label-pill ${k}`);
   renderBucket(els.statsTaxonomy, s.by_taxonomy);
+  renderBucket(els.statsVlm, s.by_vlm_agreement, (k) => `vlm-pill ${k === 'agree' ? 'agree' : k === 'disagree' ? 'disagree' : ''}`);
 }
 
 // tabs
@@ -706,7 +1048,7 @@ els.showRelations.onchange = () => { state.show.relations = els.showRelations.ch
 els.showPersons.onchange = () => { state.show.persons = els.showPersons.checked; renderActive(); };
 
 // ---- listeners ----
-[els.filterStatus, els.filterTaxonomy, els.filterLabel, els.filterSort].forEach((sel) =>
+[els.filterDataset, els.filterStatus, els.filterTaxonomy, els.filterLabel, els.filterVlmAgreement, els.filterSort].forEach((sel) =>
   sel.addEventListener("change", () => loadScenes())
 );
 els.search.addEventListener("input", () => renderScenes());

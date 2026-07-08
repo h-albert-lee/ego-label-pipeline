@@ -2,9 +2,9 @@
 """SAM-2 bidirectional tracking for a batch of objects.
 
 Reads a JSONL of job descriptions, loads SAM-2 **once**, and runs bidirectional
-mask propagation for every job without reloading the model. Compared to spawning
-run_catv_one_object.py per-row, this eliminates the ~30s SAM-2 model-load
-overhead that was previously paid for every object.
+mask propagation for every job without reloading the model, eliminating the
+~30s SAM-2 model-load overhead that per-row invocation would otherwise pay for
+every object.
 
 Requires the `sam2` package to be pip-installed (`pip install sam2`).
 
@@ -32,21 +32,14 @@ import json
 import os
 import os.path as osp
 import shutil
-import sys
+import subprocess
 import traceback
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-
-_SCRIPTS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_SCRIPTS_DIR))
-from run_catv_one_object import (  # noqa: E402
-    make_exact_prompt_frame_sequence,
-    normalize_mp4_for_viewing,
-    prepare_catv_video,
-)
+from PIL import Image
 
 _COLOR = [(255, 0, 0)]
 
@@ -74,6 +67,137 @@ def _determine_model_cfg(model_path: str) -> str:
     if "tiny" in model_path:
         return "configs/samurai/sam2.1_hiera_t.yaml"
     raise ValueError(f"Unknown SAM-2 model size in path: {model_path}")
+
+
+def _probe_video_duration(video_path: Path) -> float:
+    cmd = [
+        "ffprobe", "-hide_banner", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    text = result.stdout.strip()
+    if not text:
+        raise RuntimeError(f"ffprobe returned no duration for {video_path}")
+    return float(text)
+
+
+def _probe_video_resolution(video_path: Path) -> tuple[int, int]:
+    cmd = [
+        "ffprobe", "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0:s=x",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    text = result.stdout.strip().splitlines()[0]
+    width, height = text.split("x")
+    return int(width), int(height)
+
+
+def _prepare_catv_video(
+    video_path: Path,
+    work_dir: Path,
+    *,
+    start_sec: float,
+    duration_sec: float,
+    fps: float,
+    whole_video: bool,
+) -> Path:
+    """Create a low-fps input clip in chronological order."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    output = work_dir / "catv_input_fps1.mp4"
+
+    if not whole_video:
+        source_duration = _probe_video_duration(video_path)
+        if start_sec >= source_duration:
+            raise RuntimeError(
+                f"Requested clip start ({start_sec:.3f}s) is at or past the end of "
+                f"{video_path} (duration {source_duration:.3f}s) — nothing to extract."
+            )
+        remaining = source_duration - start_sec
+        if duration_sec > remaining:
+            duration_sec = remaining
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    if not whole_video:
+        cmd.extend(["-ss", f"{start_sec:.3f}"])
+    cmd.extend(["-i", str(video_path)])
+    if not whole_video:
+        cmd.extend(["-t", f"{duration_sec:.3f}"])
+    cmd.extend(
+        [
+            "-vf", f"fps={fps:g}",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an", "-y",
+            str(output),
+        ]
+    )
+    subprocess.run(cmd, check=True)
+    if not output.exists() or output.stat().st_size == 0:
+        raise FileNotFoundError(f"Failed to create fps={fps:g} input clip: {output}")
+    try:
+        _probe_video_resolution(output)
+    except (subprocess.CalledProcessError, IndexError, ValueError) as exc:
+        raise RuntimeError(
+            f"fps={fps:g} input clip has no decodable video frames: {output} "
+            f"(requested start={start_sec:.3f}s, duration={duration_sec:.3f}s from {video_path})"
+        ) from exc
+    return output
+
+
+def _make_exact_prompt_frame_sequence(
+    catv_video_path: Path,
+    first_frame_path: Path,
+    work_dir: Path,
+    *,
+    prompt_frame_idx: int,
+) -> tuple[Path, int]:
+    """Create a jpg frame directory and replace the prompt frame with exact SAM frame."""
+    frames_dir = work_dir / "catv_input_exact_prompt_frames"
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(catv_video_path))
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cv2.imwrite(str(frames_dir / f"{frame_idx:06d}.jpg"), frame)
+        frame_idx += 1
+    cap.release()
+    if frame_idx == 0:
+        raise RuntimeError(f"No frames could be decoded from CAT-V input video: {catv_video_path}")
+    prompt_frame_idx = max(0, min(prompt_frame_idx, frame_idx - 1))
+
+    with Image.open(first_frame_path).convert("RGB") as image:
+        image.save(frames_dir / f"{prompt_frame_idx:06d}.jpg", quality=95)
+    return frames_dir, prompt_frame_idx
+
+
+def _normalize_mp4_for_viewing(path: Path) -> None:
+    """Rewrite an MP4 as H.264/yuv420p so VS Code/browser previews can open it."""
+    if not path.exists() or path.suffix.lower() != ".mp4":
+        return
+    tmp = path.with_name(f"{path.stem}.h264{path.suffix}")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-an", "-y",
+        str(tmp),
+    ]
+    subprocess.run(cmd, check=True)
+    if tmp.exists() and tmp.stat().st_size > 0:
+        tmp.replace(path)
 
 
 def _load_frames(video_or_dir: str) -> list:
@@ -142,7 +266,7 @@ def _process_one_job(predictor, job: dict, *, device: str) -> None:
     whole_video = bool(job.get("whole_video", True))
     duration_sec = float(job.get("duration_sec", 10.0))
 
-    catv_video = prepare_catv_video(
+    catv_video = _prepare_catv_video(
         video_path,
         work_dir,
         start_sec=start_sec,
@@ -155,7 +279,7 @@ def _process_one_job(predictor, job: dict, *, device: str) -> None:
     prompt_frame_idx = int(round(max(0.0, start_sec) * fps)) if whole_video else 0
     mask_input: Path = catv_video
     if first_frame_path_str and Path(first_frame_path_str).exists():
-        mask_input, prompt_frame_idx = make_exact_prompt_frame_sequence(
+        mask_input, prompt_frame_idx = _make_exact_prompt_frame_sequence(
             catv_video,
             Path(first_frame_path_str),
             work_dir,
@@ -211,7 +335,26 @@ def _process_one_job(predictor, job: dict, *, device: str) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    normalize_mp4_for_viewing(out_masked_video)
+    _normalize_mp4_for_viewing(out_masked_video)
+
+
+def _silence_sam2_progress_bars() -> None:
+    """SAM-2 hardcodes tqdm progress bars ("frame loading (JPEG)",
+    "propagate in video") with no argument to disable them. Patch the
+    ``tqdm`` name bound in its own modules to a passthrough so
+    init_state()/propagate_in_video() run quietly instead.
+    """
+    passthrough = lambda iterable, *args, **kwargs: iterable  # noqa: E731
+    for module_name in (
+        "sam2.utils.misc",
+        "sam2.sam2_video_predictor",
+        "sam2.sam2_video_predictor_legacy",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["tqdm"])
+        except ImportError:
+            continue
+        module.tqdm = passthrough
 
 
 def main() -> int:
@@ -226,6 +369,7 @@ def main() -> int:
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
+    _silence_sam2_progress_bars()
     model_path = args.model_path
     if _is_hf_model_id(model_path):
         from sam2.build_sam import build_sam2_video_predictor_hf

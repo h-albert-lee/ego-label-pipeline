@@ -1,8 +1,10 @@
 """Typer-based CLI. Installed as ``egoown``.
 
-Subcommands mirror the pipeline stages (each step is resumable via JSONL).
-The ``serve`` command launches the FastAPI annotator UI for collaborative
-review.
+Pipeline stages (each step is resumable via JSONL):
+  ego4d-fetch-clips  → extract-bboxes → caption-bboxes-batch → one-pass-labels → vlm-crosscheck
+
+Filtering helpers:
+  filter, new-filter
 """
 
 from __future__ import annotations
@@ -10,56 +12,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 
 from egoownership import pipeline
 from egoownership.schema import Taxonomy
-try:
-    from ego_video_qa.cli import register_eval_command as _register_eval_command
-except ModuleNotFoundError:
-    _register_eval_command = None
+
+load_dotenv()
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
-download_app = typer.Typer(no_args_is_help=True, help="Dataset download helpers")
-app.add_typer(download_app, name="download")
 
 _CONSOLE = Console()
-
-if _register_eval_command is not None:
-    _register_eval_command(app, _CONSOLE)
-
-
-# ---------- downloads ----------
-
-
-@download_app.command("ego4d")
-def download_ego4d(
-    out: Path = typer.Option(Path("data/ego4d"), help="Destination directory"),
-    videos: bool = typer.Option(False, help="Also emit video download commands"),
-):
-    """Ego4D is license-gated — prints the commands you need to run yourself."""
-    from egoownership.download import ego4d
-    ego4d.download(out, videos=videos)
-
-
-@download_app.command("epic")
-def download_epic(
-    out: Path = typer.Option(Path("data/epic"), help="Destination directory"),
-    videos: bool = typer.Option(False, help="Include video download instructions"),
-):
-    """Fetch EPIC-KITCHENS-100 annotations from GitHub."""
-    from egoownership.download import epic_kitchens
-    epic_kitchens.download(out, videos=videos)
-
-
-@download_app.command("hd-epic")
-def download_hd_epic(
-    out: Path = typer.Option(Path("data/hd_epic"), help="Destination directory"),
-    videos: bool = typer.Option(False, help="Include video download instructions"),
-):
-    """HD-EPIC annotation download instructions."""
-    from egoownership.download import hd_epic
-    hd_epic.download(out, videos=videos)
 
 
 # ---------- ego4d-fetch-clips ----------
@@ -161,375 +124,86 @@ def filter_cmd(
     _CONSOLE.print(f"[green]Wrote {n} candidates[/green] → {out}")
 
 
-# ---------- egolife-annotate ----------
+# ---------- new-filter ----------
 
 
-@app.command("egolife-annotate")
-def egolife_annotate_cmd(
-    annotations: Path = typer.Option(
-        ...,
-        help="EgoLife annotation JSON/JSONL file or directory with transcript/dense captions",
+@app.command("new-filter")
+def new_filter_cmd(
+    narration: Path = typer.Option(..., help="Ego4D narration.json path"),
+    taxonomy: str = typer.Option(
+        "C",
+        help="Target taxonomy A/B/C/D, or 'all' for one JSONL with per-clip taxonomy",
     ),
-    out: Path = typer.Option(..., help="Output JSONL path for draft ownership annotations"),
-    visual_metadata: Path = typer.Option(
-        None,
-        help="Optional JSON/JSONL keyed by clip_id/event_id with person_count and face_count",
+    out: Path = typer.Option(..., help="Output JSONL path for reclassified candidates"),
+    require_shared_noun: bool = typer.Option(
+        True, help="Drop candidates whose narration has no shared-table noun"
     ),
-    min_persons: int = typer.Option(
-        2,
-        help="Minimum visible non-wearer people required by visual metadata",
-    ),
-    require_face: bool = typer.Option(
-        True,
-        "--require-face/--no-require-face",
-        help="Reject records with visual metadata indicating no visible face",
-    ),
-    include_rejected: bool = typer.Option(
+    limit: int = typer.Option(0, help="Hard cap on output candidates (0 = no cap)"),
+    videos_root: Path = typer.Option(None, help="Directory with {video_id}.mp4 files for frame extraction"),
+    frame_backend: str = typer.Option("ffmpeg", help="Frame extraction backend: ffmpeg or imageio"),
+    frames_out_dir: Path = typer.Option(None, help="Directory to save extracted frames (same layout as extract-frames)"),
+    florence_describe: bool = typer.Option(
         False,
-        "--include-rejected",
-        help="Write rejected records too, with filter_reasons",
+        help="After taxonomy pass, run Florence-2 <OD> on sparse frames and merge object labels into nouns",
     ),
-    require_visual_pass: bool = typer.Option(
+    florence_model: str = typer.Option("microsoft/Florence-2-base", help="HuggingFace Florence-2 model id"),
+    florence_device: str = typer.Option("", help="Device for Florence-2 (empty = cuda if available else cpu)"),
+    auto_download: bool = typer.Option(False, help="Auto-download missing videos via ego4d CLI when --videos-root is set"),
+    llm_parse: bool = typer.Option(
         False,
-        "--require-visual-pass",
-        help="Only keep records whose visual metadata passes person/face filters",
+        help="Use spaCy candidates + OpenAI to pick object/verb and contextual vs baseline",
     ),
-    limit: int = typer.Option(0, help="Hard cap on output rows (0 = no cap)"),
-    progress: bool = typer.Option(
-        True,
-        "--progress/--no-progress",
-        help="Show a tqdm progress bar while writing draft annotations",
+    openai_model: str = typer.Option(
+        "gpt-4o-mini",
+        help="OpenAI model for --llm-parse (also EGOOWN_NARRATION_OPENAI_MODEL)",
     ),
-    output_format: str = typer.Option(
-        "candidate",
-        help="Output JSONL shape: candidate matches ClipCandidate, draft keeps verbose debugging fields",
+    llm_batch_size: int = typer.Option(
+        20,
+        help="Narrations per OpenAI request when --llm-parse is enabled",
+    ),
+    no_table_object_prefilter: bool = typer.Option(
+        False,
+        help="Do not require 'table' and '#O' in narration (default: require both)",
     ),
 ):
-    """Draft EgoLife ownership annotations from transcripts/dense captions.
+    """Filter candidates from Ego4D narration.json (narration_pass narrations)."""
+    if taxonomy.lower() in ("all", "*", "any"):
+        tax = None
+    else:
+        try:
+            tax = Taxonomy(taxonomy.upper())
+        except ValueError:
+            raise typer.BadParameter(
+                f"taxonomy must be one of A/B/C/D or 'all', got {taxonomy!r}"
+            )
 
-    Captions/transcripts provide a cheap keep/reject/needs_vlm prefilter and a
-    taxonomy seed. Use egolife-vlm-filter for frame-based person/face filtering.
-    """
-    from egoownership.egolife_annotations import (
-        write_egolife_annotation_drafts,
-    )
-
-    if output_format not in ("candidate", "draft"):
-        raise typer.BadParameter("--output-format must be one of: candidate, draft")
-
-    n = write_egolife_annotation_drafts(
-        annotations,
-        out,
-        visual_metadata_path=visual_metadata,
-        min_persons=min_persons,
-        require_face=require_face,
-        include_rejected=include_rejected,
-        require_visual_pass=require_visual_pass,
+    n = pipeline.stage_new_filter(
+        narration_path=narration,
+        taxonomy=tax,
+        out_path=out,
+        require_shared_noun=require_shared_noun,
         limit=limit if limit > 0 else None,
-        show_progress=progress,
-        output_format=output_format,
+        videos_root=videos_root,
+        frame_backend=frame_backend,
+        frames_out_dir=frames_out_dir,
+        florence_describe=florence_describe,
+        florence_model=florence_model,
+        florence_device=(florence_device or None),
+        auto_download=auto_download,
+        use_llm_parse=llm_parse,
+        openai_model=openai_model,
+        llm_batch_size=llm_batch_size if llm_parse else None,
+        require_table_object_markers=not no_table_object_prefilter,
     )
-    _CONSOLE.print(f"[green]Wrote {n} EgoLife {output_format} records[/green] → {out}")
+    if tax is None:
+        _CONSOLE.print(f"[green]Wrote {n} candidates[/green] (split by taxonomy):")
+        for t, path in pipeline.paths_per_taxonomy_out(out).items():
+            _CONSOLE.print(f"  {t.value} → {path}")
+    else:
+        _CONSOLE.print(f"[green]Wrote {n} candidates[/green] → {out}")
 
 
-# ---------- egolife-vlm-filter ----------
-
-
-@app.command("egolife-vlm-filter")
-def egolife_vlm_filter_cmd(
-    annotations: Path = typer.Option(
-        ...,
-        help="EgoLifeCap directory or EgoLife annotation JSON/JSONL",
-    ),
-    videos_root: Path = typer.Option(
-        ...,
-        help="Root containing EgoLife mp4 files, e.g. data/egolife/raw/data/EgoLife",
-    ),
-    out: Path = typer.Option(..., help="Output filtered EgoLife candidate JSONL path"),
-    frames_dir: Path = typer.Option(
-        None,
-        help="Optional cache directory for extracted sparse frames",
-    ),
-    model_id: str = typer.Option(
-        "Qwen/Qwen2.5-VL-7B-Instruct",
-        help="Open-source VLM checkpoint for visual person/face filtering",
-    ),
-    device: str = typer.Option("auto", help="Device for VLM: auto, cuda:0, cpu"),
-    dtype: str = typer.Option("auto", help="Dtype: auto, float16, bfloat16, float32"),
-    max_new_tokens: int = typer.Option(128, help="Maximum generated tokens per VLM judgement"),
-    vlm_image_size: int = typer.Option(
-        224,
-        help="Resize each sparse frame to this square pixel size before VLM inference; 0 disables resizing",
-    ),
-    min_visible_people: int = typer.Option(
-        2,
-        help="Reject if fewer than this many visible people are seen across frames",
-    ),
-    require_face: bool = typer.Option(
-        True,
-        "--require-face/--no-require-face",
-        help="Reject if the VLM reports no visible face",
-    ),
-    backend: str = typer.Option("ffmpeg", help="Frame extraction backend: ffmpeg or imageio"),
-    limit: int = typer.Option(0, help="Hard cap on candidates (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-    split_by_person_day: bool = typer.Option(
-        False,
-        "--split-by-person-day/--single-file",
-        help="When enabled, treat --out as a directory and save A*_*/DAY*.jsonl files",
-    ),
-    debug_samples: int = typer.Option(
-        0,
-        help="Print the first N passing candidate records for debugging",
-    ),
-):
-    """Filter EgoLife annotations with caption hints and an open-source VLM."""
-    from egoownership.egolife_visual_filter import (
-        QwenVLSceneJudge,
-        QwenVLSceneJudgeConfig,
-        write_egolife_vlm_filtered_candidates,
-    )
-
-    if not annotations.exists():
-        raise typer.BadParameter(
-            f"EgoLife annotations path does not exist: {annotations}.",
-            param_hint="--annotations",
-        )
-
-    judge = QwenVLSceneJudge(
-        QwenVLSceneJudgeConfig(
-            model_id=model_id,
-            device=device,
-            dtype=dtype,
-            max_new_tokens=max_new_tokens,
-            image_size=vlm_image_size,
-        )
-    )
-    n = write_egolife_vlm_filtered_candidates(
-        annotations,
-        videos_root,
-        out,
-        frames_dir=frames_dir,
-        judge=judge,
-        min_visible_people=min_visible_people,
-        require_face=require_face,
-        backend=backend,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-        split_by_person_day=split_by_person_day,
-        debug_samples=debug_samples,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} EgoLife VLM-filtered candidates[/green] → {out}")
-
-
-# ---------- egolife-qwen-nouns ----------
-
-
-@app.command("egolife-qwen-nouns")
-def egolife_qwen_nouns_cmd(
-    annotations: Path = typer.Option(
-        ...,
-        help="EgoLifeCap directory containing DenseCaption and Transcript folders",
-    ),
-    out: Path = typer.Option(
-        Path("data/egolife/egolife_table_caption_qwen_translations.jsonl"),
-        help="Output JSONL with Qwen translations and spaCy noun/verb candidates",
-    ),
-    noun_summary_out: Path = typer.Option(
-        Path("data/egolife/egolife_table_caption_qwen_noun_summary.jsonl"),
-        help="Output JSONL summarizing noun frequency after Qwen translation",
-    ),
-    model_id: str = typer.Option(
-        "Qwen/Qwen2.5-3B-Instruct",
-        help="Text-only Qwen checkpoint used for Chinese-to-English translation",
-    ),
-    device: str = typer.Option("auto", help="Device for Qwen: auto, cpu, cuda:0"),
-    dtype: str = typer.Option("auto", help="Dtype: auto, float16, bfloat16, float32"),
-    max_new_tokens: int = typer.Option(96, help="Maximum generated tokens per translation"),
-    local_files_only: bool = typer.Option(
-        False,
-        "--local-files-only/--allow-download",
-        help="Use only locally cached model files",
-    ),
-    limit: int = typer.Option(0, help="Hard cap on table-caption rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Translate table-related EgoLife captions/transcripts with Qwen, then extract nouns."""
-    from egoownership.egolife_qwen_nouns import (
-        QwenCaptionTranslator,
-        QwenTranslationConfig,
-        write_qwen_translated_table_caption_nouns,
-    )
-
-    translator = QwenCaptionTranslator(
-        QwenTranslationConfig(
-            model_id=model_id,
-            device=device,
-            dtype=dtype,
-            max_new_tokens=max_new_tokens,
-            local_files_only=local_files_only,
-        )
-    )
-    n = write_qwen_translated_table_caption_nouns(
-        annotations,
-        out,
-        translate_fn=translator.translate,
-        noun_summary_out=noun_summary_out,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-    )
-    _CONSOLE.print(
-        f"[green]Wrote {n} Qwen-translated table captions[/green] → {out}\n"
-        f"[green]Noun summary[/green] → {noun_summary_out}"
-    )
-
-
-# ---------- ego4d-table-object-nouns ----------
-
-
-@app.command("ego4d-table-object-nouns")
-def ego4d_table_object_nouns_cmd(
-    narration: Path = typer.Option(
-        Path("ego4d_data/v2/annotations/narration.json"),
-        help="Ego4D narration.json path",
-    ),
-    out: Path = typer.Option(
-        Path("data/ego4d/ego4d_table_caption_object_nouns.jsonl"),
-        help="Output JSONL object noun allowlist",
-    ),
-    require_observer: bool = typer.Option(
-        False,
-        "--require-observer/--all-table-narrations",
-        help="Only mine nouns from #O observer narrations (default: all table narrations)",
-    ),
-    batch_size: int = typer.Option(2048, help="spaCy batch size for narration mining"),
-    limit: int = typer.Option(0, help="Hard cap on table narrations scanned (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Mine spaCy object nouns from Ego4D table narrations into an allowlist JSONL."""
-    from egoownership.catv_nouns import write_ego4d_table_caption_object_nouns
-
-    narrations_with_nouns, noun_count = write_ego4d_table_caption_object_nouns(
-        narration,
-        out,
-        require_observer=require_observer,
-        batch_size=batch_size,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-    )
-    _CONSOLE.print(
-        f"[green]Wrote {noun_count} object nouns[/green] from "
-        f"{narrations_with_nouns} table narrations → {out}"
-    )
-
-
-# ---------- sam2-extract-objects ----------
-
-
-@app.command("sam2-extract-objects")
-def sam2_extract_objects_cmd(
-    input_jsonl: Path = typer.Option(
-        ...,
-        "--input",
-        help="Input benchmark JSONL, e.g. data/hf/.../jsonl/egolife.jsonl",
-    ),
-    frames_root: Path = typer.Option(
-        Path("data/hf/ego-implicit-ownership-multiperson/frames"),
-        help="Root containing frame images, e.g. data/hf/ego-implicit-ownership-multiperson/frames",
-    ),
-    egolife_videos_root: Path = typer.Option(
-        None,
-        help="Optional EgoLife video root, e.g. /data/video_datasets/EgoLife",
-    ),
-    ego4d_videos_root: Path = typer.Option(
-        None,
-        help="Optional Ego4D full_scale video root, e.g. /data/video_datasets/Ego4D/v2/full_scale",
-    ),
-    extracted_frames_dir: Path = typer.Option(
-        Path("outputs/sam2_extracted_frames"),
-        help="Where to cache frames extracted from videos when JSONL frame paths are absent",
-    ),
-    skip_source_datasets: str = typer.Option(
-        "hd_epic",
-        help="Comma-separated source_dataset values to skip, e.g. hd_epic",
-    ),
-    out: Path = typer.Option(..., help="Output JSONL with SAM-2 object candidates"),
-    model_id: str = typer.Option(
-        "facebook/sam-vit-base",
-        help="SAM/SAM-2 mask-generation checkpoint. Default is SAM because current test env cannot load HF sam2_video.",
-    ),
-    device: str = typer.Option("auto", help="Device for mask generation: auto, cpu, cuda:0"),
-    frame_tags: str = typer.Option(
-        "t",
-        help="Comma-separated sparse frame tags to process: t, t-1, t-2",
-    ),
-    min_area_ratio: float = typer.Option(
-        0.001,
-        help="Drop masks smaller than this image-area fraction",
-    ),
-    max_area_ratio: float = typer.Option(
-        0.75,
-        help="Drop masks larger than this image-area fraction",
-    ),
-    max_objects_per_frame: int = typer.Option(
-        30,
-        help="Keep at most this many SAM-2 object candidates per frame",
-    ),
-    nms_iou_threshold: float = typer.Option(
-        0.90,
-        help="Deduplicate highly overlapping mask boxes by this IoU threshold",
-    ),
-    limit: int = typer.Option(0, help="Hard cap on input rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Use SAM-2 masks to add generic object candidates to benchmark JSONL.
-
-    Entries with no resolvable frame image or no usable object masks are skipped.
-    SAM-2 does not provide semantic names; labels are saved as ``sam2_object`` for
-    later VLM target selection/naming.
-    """
-    from egoownership.sam2_objects import (
-        FRAME_KEYS,
-        Sam2ObjectConfig,
-        Sam2ObjectExtractor,
-        write_sam2_object_jsonl,
-    )
-
-    tags = tuple(tag.strip() for tag in frame_tags.split(",") if tag.strip())
-    unknown = [tag for tag in tags if tag not in FRAME_KEYS]
-    if unknown:
-        raise typer.BadParameter(f"Unknown frame tag(s): {unknown}. Use t,t-1,t-2")
-
-    extractor = Sam2ObjectExtractor(
-        Sam2ObjectConfig(
-            model_id=model_id,
-            device=device,
-            min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio,
-            max_objects_per_frame=max_objects_per_frame,
-            nms_iou_threshold=nms_iou_threshold,
-        )
-    )
-    video_roots = {}
-    if egolife_videos_root is not None:
-        video_roots["egolife"] = egolife_videos_root
-    if ego4d_videos_root is not None:
-        video_roots["ego4d"] = ego4d_videos_root
-        video_roots["ego4d_fho"] = ego4d_videos_root
-    skip_sources = {item.strip() for item in skip_source_datasets.split(",") if item.strip()}
-    n = write_sam2_object_jsonl(
-        input_jsonl,
-        frames_root,
-        out,
-        extractor=extractor,
-        video_roots=video_roots or None,
-        extracted_frames_dir=extracted_frames_dir,
-        skip_source_datasets=skip_sources,
-        frame_tags=tags,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} entries with SAM-2 object candidates[/green] → {out}")
+# ---------- extract-bboxes ----------
 
 
 @app.command("extract-bboxes")
@@ -659,112 +333,7 @@ def extract_bboxes_cmd(
     _CONSOLE.print(f"[green]Wrote {n} {dataset} bbox rows[/green] → {resolved_out}")
 
 
-@app.command("caption-bboxes")
-def caption_bboxes_cmd(
-    input_jsonl: Path = typer.Option(
-        ...,
-        "--input",
-        help="BBox JSONL produced by extract-bboxes",
-    ),
-    out: Path = typer.Option(..., help="Output JSONL with CAT-V object captions"),
-    catv_command_template: str = typer.Option(
-        None,
-        help="Shell command template for CAT-V captioning. If unset, built automatically from "
-        "--captioner-backend/--caption-model-path/--caption-device.",
-    ),
-    captioner_backend: str = typer.Option(
-        "qwen3vl",
-        help="qwen3vl (default): caption via Qwen3-VL (scripts/run_catv_one_object.py, runs under the sam2hf env). "
-        "Ignored if --catv-command-template is set.",
-    ),
-    caption_model_path: str = typer.Option(
-        None,
-        help="Override the captioning model id. Default: Qwen/Qwen3-VL-8B-Instruct.",
-    ),
-    caption_device: str = typer.Option("cuda:0", help="Device for the captioning model"),
-    caption_fps: float = typer.Option(
-        1.0,
-        help="Frames/sec sampled from each object's whole clip before captioning. With "
-        "--whole-video, even fps=1 yields plenty of frames since EgoLife source clips run "
-        "~17-30s; total frames are still capped at --caption-max-frames downstream regardless.",
-    ),
-    caption_max_frames: int = typer.Option(
-        16,
-        help="Hard cap on frames sent to the captioning model per object, after sampling at "
-        "--caption-fps across the whole clip.",
-    ),
-    catv_work_dir: Path = typer.Option(
-        Path("outputs/catv_work"),
-        help="Directory for CAT-V temporary work files",
-    ),
-    catv_visualization_dir: Path = typer.Option(
-        Path("outputs/catv_visualizations"),
-        help="Directory for persistent SAM2/CAT-V masked visualization videos",
-    ),
-    keep_catv_work_dir: bool = typer.Option(
-        False,
-        "--keep-catv-work-dir",
-        help="Keep per-object CAT-V intermediate files after successful captions",
-    ),
-    save_catv_visualizations: bool = typer.Option(
-        True,
-        "--save-catv-visualizations/--no-save-catv-visualizations",
-        help="Copy each object's SAM2 masked video to catv-visualization-dir",
-    ),
-    show_catv_logs: bool = typer.Option(
-        False,
-        "--catv-logs",
-        help="Stream CAT-V subprocess stdout/stderr instead of suppressing it",
-    ),
-    resume: bool = typer.Option(
-        True,
-        "--resume/--overwrite",
-        help="Append to existing output and skip IDs already written; --overwrite starts fresh",
-    ),
-    limit: int = typer.Option(0, help="Hard cap on bbox rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Run CAT-V captions for existing bbox rows (dataset-agnostic)."""
-    from egoownership.catv_pipeline import (
-        CatVCommandCaptioner,
-        write_catv_captions_from_bbox_jsonl,
-    )
-
-    if catv_command_template is None:
-        if captioner_backend != "qwen3vl":
-            raise typer.BadParameter("--captioner-backend must be 'qwen3vl'")
-        import sys as _sys
-        model_path = caption_model_path or "Qwen/Qwen3-VL-8B-Instruct"
-        script_path = Path(__file__).resolve().parent.parent.parent / "scripts" / "run_catv_one_object.py"
-        catv_command_template = (
-            f"{_sys.executable} {script_path} "
-            "--video {video_path} --first-frame {first_frame_path} "
-            "--bbox {bbox_path} --out {output_json} "
-            f"--catv-device {caption_device} "
-            f"--start-sec {{start_sec}} --fps {caption_fps:g} --whole-video "
-            f"--max-frames-num {caption_max_frames} "
-            f"--captioner-backend qwen3vl "
-            f"--model-path {model_path} "
-            "--caption {object_nouns}"
-        )
-
-    captioner = CatVCommandCaptioner(
-        command_template=catv_command_template,
-        work_root=catv_work_dir,
-        visualization_root=catv_visualization_dir,
-        keep_work_dir=keep_catv_work_dir,
-        suppress_output=not show_catv_logs,
-        save_visualizations=save_catv_visualizations,
-    )
-    n = write_catv_captions_from_bbox_jsonl(
-        input_jsonl,
-        out,
-        captioner=captioner,
-        limit=limit if limit > 0 else None,
-        resume=resume,
-        show_progress=progress,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} CAT-V object captions[/green] → {out}")
+# ---------- caption-bboxes-batch ----------
 
 
 @app.command("caption-bboxes-batch")
@@ -853,6 +422,9 @@ def caption_bboxes_batch_cmd(
     _CONSOLE.print(f"[green]Wrote {n} CAT-V object captions (batch)[/green] → {resolved_out}")
 
 
+# ---------- one-pass-labels ----------
+
+
 @app.command("one-pass-labels")
 def one_pass_labels_cmd(
     input_jsonl: Path = typer.Option(
@@ -898,13 +470,9 @@ def one_pass_labels_cmd(
         "rules",
         help="How to decide taxonomy/ground-truth from evidence: 'rules' or 'llm'",
     ),
-    object_type_backend: str = typer.Option(
-        "rules",
-        help="How to classify object type (personal/shared/generic_object): 'rules' or 'llm'",
-    ),
     decision_model_id: str = typer.Option(
         "Qwen/Qwen3-4B",
-        help="Text LLM checkpoint used when --decision-backend=llm or --object-type-backend=llm",
+        help="Text LLM checkpoint used when --decision-backend=llm",
     ),
     decision_device: str = typer.Option("auto", help="Device for the LLM decider: auto, cpu, cuda:0"),
     review_dir: Path = typer.Option(
@@ -926,31 +494,22 @@ def one_pass_labels_cmd(
     decision_fn = None
     if decision_backend == "llm":
         from egoownership.catv_evidence_label import LLMTaxonomyDecider
-
         decision_fn = LLMTaxonomyDecider(model_id=decision_model_id, device=decision_device)
     elif decision_backend != "rules":
         raise typer.BadParameter("--decision-backend must be 'rules' or 'llm'")
-
-    object_type_fn = None
-    if object_type_backend == "llm":
-        from egoownership.catv_evidence_label import LLMObjectTypeClassifier
-
-        object_type_fn = LLMObjectTypeClassifier(model_id=decision_model_id, device=decision_device)
-    elif object_type_backend != "rules":
-        raise typer.BadParameter("--object-type-backend must be 'rules' or 'llm'")
 
     ds = dataset or input_jsonl.parent.name
     resolved_out = out or (Path("outputs") / ds / "labels.jsonl")
     resolved_frames_dir = frames_dir or (Path("outputs") / ds / "one_pass_sparse_frames")
     progress_desc = f"{ds} one-pass labels"
+    effective_detect_persons = detect_persons or bool(sam2_tracking_model_id)
 
     n = write_one_pass_labels(
         input_jsonl,
         resolved_out,
         frames_dir=resolved_frames_dir,
-        detect_persons=detect_persons,
+        detect_persons=effective_detect_persons,
         decision_fn=decision_fn,
-        object_type_fn=object_type_fn,
         sam3_model_id=sam3_model_id or None,
         sam2_tracking_model_id=sam2_tracking_model_id or None,
         sam2_tracking_device=sam2_tracking_device,
@@ -963,82 +522,6 @@ def one_pass_labels_cmd(
         progress_desc=progress_desc,
     )
     _CONSOLE.print(f"[green]Wrote {n} one-pass labels[/green] → {resolved_out}")
-
-
-@app.command("visualize-labels")
-def visualize_labels_cmd(
-    input_jsonl: Path = typer.Option(
-        ...,
-        "--input",
-        help="One-pass labels JSONL with frame_t_minus_2/1_path, frame_t_path, evidence, auto_* fields",
-    ),
-    out_dir: Path = typer.Option(..., help="Directory for per-record review composite images"),
-    max_width: int = typer.Option(900, help="Max pixel width of each stacked frame"),
-    resume: bool = typer.Option(
-        True,
-        "--resume/--overwrite",
-        help="Skip records whose review image already exists; --overwrite re-renders everything",
-    ),
-    limit: int = typer.Option(0, help="Hard cap on input rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Render per-record review images: t-2/t-1/t frames stacked row-by-row,
-    with a caption panel below showing the auto taxonomy/ground-truth and
-    supporting evidence."""
-    from egoownership.catv_pipeline import write_annotation_review_images
-
-    n = write_annotation_review_images(
-        input_jsonl,
-        out_dir,
-        max_width=max_width,
-        limit=limit if limit > 0 else None,
-        resume=resume,
-        show_progress=progress,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} annotation review images[/green] → {out_dir}")
-
-
-@app.command("egolife-review-gradio")
-def egolife_review_gradio_cmd(
-    labels: Path = typer.Option(
-        Path("outputs/egolife/annotations_llm.jsonl"),
-        help="One-pass labels JSONL used to generate the review images",
-    ),
-    review_dir: Path = typer.Option(
-        Path("outputs/egolife/annotation_review"),
-        help="Directory of review composite JPGs from egolife-visualize-labels",
-    ),
-    host: str = typer.Option("0.0.0.0", help="Bind address (0.0.0.0 for LAN sharing)"),
-    port: int = typer.Option(
-        7860,
-        help="Gradio port (auto-picks the next free port if busy)",
-        envvar="GRADIO_SERVER_PORT",
-    ),
-    share: bool = typer.Option(
-        False,
-        "--share/--no-share",
-        help="Create a temporary public gradio.live link",
-    ),
-):
-    """Browse and edit EgoLife annotation review composites in a Gradio UI.
-
-    Saves human corrections to review_taxonomy, review_ground_truth, and
-    review_evidence in the labels JSONL.
-    """
-    from egoownership.egolife_review_gradio import launch_egolife_review_gradio, review_stats
-
-    stats = review_stats(labels, review_dir)
-    _CONSOLE.print(
-        f"[green]Loaded {stats['entries']} review images[/green] "
-        f"({stats['needs_review']} flagged needs_review)"
-    )
-    launch_egolife_review_gradio(
-        labels,
-        review_dir,
-        host=host,
-        port=port,
-        share=share,
-    )
 
 
 # ---------- vlm-crosscheck ----------
@@ -1067,14 +550,13 @@ def vlm_crosscheck_cmd(
     judges: list[str] = typer.Option(
         [],
         "--judge",
-        help="Judge spec: 'qwen:<model_id>', 'anthropic:<model_id>', or 'openai:<model_id>'. "
-             "Repeat for multiple judges, e.g. --judge qwen:Qwen/Qwen2.5-VL-7B-Instruct "
-             "--judge anthropic:claude-sonnet-4-6",
+        help="Judge spec: 'qwen:<model_id>', 'anthropic:<model_id>', 'openai:<model_id>', or 'gemini:<model_id>'. "
+             "Repeat for multiple judges.",
     ),
     qwen_device: str = typer.Option("auto", help="Device for local Qwen VL judges"),
     qwen_dtype: str = typer.Option("auto", help="Dtype for Qwen VL: auto, float16, bfloat16"),
     qwen_max_tokens: int = typer.Option(256, help="Max new tokens for Qwen VL response"),
-    remote_max_tokens: int = typer.Option(512, help="Max tokens for Anthropic/OpenAI response"),
+    remote_max_tokens: int = typer.Option(512, help="Max tokens for Anthropic/OpenAI/Gemini response"),
     resume: bool = typer.Option(True, "--resume/--overwrite"),
     limit: int = typer.Option(0, help="Hard cap on records processed (0 = no cap)"),
     progress: bool = typer.Option(True, "--progress/--no-progress"),
@@ -1082,25 +564,27 @@ def vlm_crosscheck_cmd(
     """Cross-check ownership labels with multiple VLM judges.
 
     Each judge independently predicts MINE / PERSON_k / SHARED / AMBIGUOUS from
-    the three sparse frames + narration + object description, without seeing the
-    pipeline's own prediction.  Agreement with auto_ground_truth is recorded per
-    judge, along with a majority-vote label.
+    the three sparse frames alone (target bbox drawn on each) — no narration,
+    no object visual description (that's generated by our own captioning
+    stage, so including it would leak our own pipeline's reasoning), and no
+    access to the pipeline's own prediction or evidence. Each judge answers
+    with a label plus one sentence per remaining evidence aspect (object type,
+    zone, relation/contact, temporal context) using the same field names as
+    scene_records.jsonl's auto_key_evidence (object_type_evidence,
+    zone_evidence, relation_graph_evidence, context_change_evidence), so a
+    judge's reasoning can be compared side-by-side with the pipeline's own,
+    aspect by aspect.
+    Agreement with auto_ground_truth is recorded per judge, along with a
+    majority-vote label.
 
     Examples:
 
     \\b
-        # Two judges: local Qwen + Claude
         egoown vlm-crosscheck \\
             --input outputs/egolife/labels.jsonl \\
-            --judge qwen:Qwen/Qwen2.5-VL-7B-Instruct \\
-            --judge anthropic:claude-sonnet-4-6
-
-        # Three judges
-        egoown vlm-crosscheck \\
-            --input outputs/ego4d/labels.jsonl \\
             --judge anthropic:claude-sonnet-4-6 \\
             --judge openai:gpt-4o \\
-            --judge qwen:Qwen/Qwen2.5-VL-7B-Instruct
+            --judge gemini:gemini-2.0-flash
     """
     from egoownership.vlm_crosscheck import (
         AnthropicOwnershipJudge,
@@ -1119,33 +603,23 @@ def vlm_crosscheck_cmd(
 
     judge_objs = []
     for spec in judges:
-        if ":" in spec:
-            backend, model_id = spec.split(":", 1)
-        else:
-            backend, model_id = spec, spec
+        backend, model_id = spec.split(":", 1) if ":" in spec else (spec, spec)
         backend = backend.lower()
-
         if backend == "qwen":
             judge_objs.append(QwenOwnershipJudge(QwenOwnershipJudgeConfig(
-                model_id=model_id,
-                device=qwen_device,
-                dtype=qwen_dtype,
-                max_new_tokens=qwen_max_tokens,
+                model_id=model_id, device=qwen_device, dtype=qwen_dtype, max_new_tokens=qwen_max_tokens,
             )))
         elif backend == "anthropic":
             judge_objs.append(AnthropicOwnershipJudge(AnthropicOwnershipJudgeConfig(
-                model_id=model_id,
-                max_tokens=remote_max_tokens,
+                model_id=model_id, max_tokens=remote_max_tokens,
             )))
         elif backend == "openai":
             judge_objs.append(OpenAIOwnershipJudge(OpenAIOwnershipJudgeConfig(
-                model_id=model_id,
-                max_tokens=remote_max_tokens,
+                model_id=model_id, max_tokens=remote_max_tokens,
             )))
         elif backend == "gemini":
             judge_objs.append(GeminiOwnershipJudge(GeminiOwnershipJudgeConfig(
-                model_id=model_id,
-                max_tokens=remote_max_tokens,
+                model_id=model_id, max_tokens=remote_max_tokens,
             )))
         else:
             raise typer.BadParameter(
@@ -1165,471 +639,6 @@ def vlm_crosscheck_cmd(
         show_progress=progress,
     )
     _CONSOLE.print(f"[green]Wrote {n} cross-check rows[/green] → {resolved_out}")
-
-
-# ---------- sam2-vlm-build ----------
-
-
-@app.command("vlm-ground-objects")
-def vlm_ground_objects_cmd(
-    input_jsonl: Path = typer.Option(
-        ...,
-        "--input",
-        help="Input benchmark JSONL, e.g. data/hf/.../jsonl/egolife.jsonl",
-    ),
-    frames_root: Path = typer.Option(
-        Path("data/hf/ego-implicit-ownership-multiperson/frames"),
-        help="Root containing frame images",
-    ),
-    out: Path = typer.Option(..., help="Output JSONL with VLM nouns and Grounding DINO boxes"),
-    vlm_model_id: str = typer.Option(
-        "Qwen/Qwen2.5-VL-7B-Instruct",
-        help="Open-source VLM checkpoint for tabletop noun proposal",
-    ),
-    vlm_device: str = typer.Option("auto", help="Device for VLM: auto, cpu, cuda:0"),
-    vlm_dtype: str = typer.Option("auto", help="VLM dtype: auto, float16, bfloat16, float32"),
-    max_new_tokens: int = typer.Option(192, help="Maximum generated tokens per VLM noun proposal"),
-    dino_model_id: str = typer.Option(
-        "IDEA-Research/grounding-dino-tiny",
-        help="Grounding DINO checkpoint for localizing proposed nouns",
-    ),
-    dino_device: str = typer.Option("auto", help="Device for Grounding DINO: auto, cpu, cuda:0"),
-    box_threshold: float = typer.Option(0.25, help="Grounding DINO box threshold"),
-    text_threshold: float = typer.Option(0.20, help="Grounding DINO text threshold"),
-    max_detections: int = typer.Option(30, help="Maximum grounded detections per frame"),
-    frame_tag: str = typer.Option("t", help="Sparse frame tag to process: t, t-1, or t-2"),
-    limit: int = typer.Option(0, help="Hard cap on input rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """List tabletop nouns with a VLM, then localize them with Grounding DINO.
-
-    This command writes object nouns and positions only. It strips ownership
-    labels/rationales from copied input rows.
-    """
-    from egoownership.sam2_objects import FRAME_KEYS
-    from egoownership.vlm_ground_objects import (
-        GroundingDinoObjectGrounder,
-        GroundingDinoObjectGrounderConfig,
-        QwenNounProposer,
-        QwenNounProposerConfig,
-        write_vlm_grounded_objects,
-    )
-
-    if frame_tag not in FRAME_KEYS:
-        raise typer.BadParameter(f"Unknown --frame-tag {frame_tag!r}. Use t,t-1,t-2")
-
-    noun_proposer = QwenNounProposer(
-        QwenNounProposerConfig(
-            model_id=vlm_model_id,
-            device=vlm_device,
-            dtype=vlm_dtype,
-            max_new_tokens=max_new_tokens,
-        )
-    )
-    grounder = GroundingDinoObjectGrounder(
-        GroundingDinoObjectGrounderConfig(
-            model_id=dino_model_id,
-            device=None if dino_device in ("auto", "") else dino_device,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            max_detections=max_detections,
-        )
-    )
-    n = write_vlm_grounded_objects(
-        input_jsonl,
-        frames_root,
-        out,
-        noun_proposer=noun_proposer,
-        grounder=grounder,
-        frame_tag=frame_tag,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} VLM-grounded object entries[/green] → {out}")
-
-
-@app.command("sam2-vlm-build")
-def sam2_vlm_build_cmd(
-    input_jsonl: Path = typer.Option(
-        ...,
-        "--input",
-        help="Input benchmark JSONL, e.g. data/hf/.../jsonl/egolife.jsonl",
-    ),
-    frames_root: Path = typer.Option(
-        Path("data/hf/ego-implicit-ownership-multiperson/frames"),
-        help="Root containing frame images, e.g. data/hf/ego-implicit-ownership-multiperson/frames",
-    ),
-    egolife_videos_root: Path = typer.Option(
-        None,
-        help="Optional EgoLife video root, e.g. /data/video_datasets/EgoLife",
-    ),
-    ego4d_videos_root: Path = typer.Option(
-        None,
-        help="Optional Ego4D full_scale video root, e.g. /data/video_datasets/Ego4D/v2/full_scale",
-    ),
-    extracted_frames_dir: Path = typer.Option(
-        Path("outputs/sam2_extracted_frames"),
-        help="Where to cache frames extracted from videos when JSONL frame paths are absent",
-    ),
-    annotated_frames_dir: Path = typer.Option(
-        Path("outputs/sam2_vlm_annotated_frames"),
-        help="Where numbered SAM object-box images are saved for VLM inspection",
-    ),
-    skip_source_datasets: str = typer.Option(
-        "hd_epic",
-        help="Comma-separated source_dataset values to skip, e.g. hd_epic",
-    ),
-    out: Path = typer.Option(..., help="Final output JSONL with object nouns and box positions"),
-    sam_model_id: str = typer.Option(
-        "facebook/sam-vit-base",
-        help="SAM/SAM-2 mask-generation checkpoint. Default is SAM because current test env cannot load HF sam2_video.",
-    ),
-    sam_device: str = typer.Option("auto", help="Device for SAM mask generation: auto, cpu, cuda:0"),
-    vlm_model_id: str = typer.Option(
-        "Qwen/Qwen2.5-VL-7B-Instruct",
-        help="Open-source VLM checkpoint for object noun naming",
-    ),
-    vlm_device: str = typer.Option("auto", help="Device for VLM: auto, cpu, cuda:0"),
-    vlm_dtype: str = typer.Option("auto", help="VLM dtype: auto, float16, bfloat16, float32"),
-    max_new_tokens: int = typer.Option(384, help="Maximum generated tokens per VLM judgement"),
-    frame_tag: str = typer.Option("t", help="Sparse frame tag to process: t, t-1, or t-2"),
-    min_area_ratio: float = typer.Option(
-        0.001,
-        help="Drop masks smaller than this image-area fraction",
-    ),
-    max_area_ratio: float = typer.Option(
-        0.75,
-        help="Drop masks larger than this image-area fraction",
-    ),
-    max_objects_per_frame: int = typer.Option(
-        30,
-        help="Keep at most this many SAM/SAM-2 object candidates",
-    ),
-    nms_iou_threshold: float = typer.Option(
-        0.90,
-        help="Deduplicate highly overlapping mask boxes by this IoU threshold",
-    ),
-    limit: int = typer.Option(0, help="Hard cap on input rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Run SAM/SAM-2 object proposals and VLM noun labeling as one JSONL pipeline."""
-    from egoownership.sam2_objects import FRAME_KEYS, Sam2ObjectConfig, Sam2ObjectExtractor
-    from egoownership.sam2_vlm_label import (
-        QwenObjectLabelJudge,
-        QwenObjectLabelJudgeConfig,
-        write_sam2_vlm_object_labels,
-    )
-
-    if frame_tag not in FRAME_KEYS:
-        raise typer.BadParameter(f"Unknown --frame-tag {frame_tag!r}. Use t,t-1,t-2")
-
-    extractor = Sam2ObjectExtractor(
-        Sam2ObjectConfig(
-            model_id=sam_model_id,
-            device=sam_device,
-            min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio,
-            max_objects_per_frame=max_objects_per_frame,
-            nms_iou_threshold=nms_iou_threshold,
-        )
-    )
-    judge = QwenObjectLabelJudge(
-        QwenObjectLabelJudgeConfig(
-            model_id=vlm_model_id,
-            device=vlm_device,
-            dtype=vlm_dtype,
-            max_new_tokens=max_new_tokens,
-        )
-    )
-    video_roots = {}
-    if egolife_videos_root is not None:
-        video_roots["egolife"] = egolife_videos_root
-    if ego4d_videos_root is not None:
-        video_roots["ego4d"] = ego4d_videos_root
-        video_roots["ego4d_fho"] = ego4d_videos_root
-    skip_sources = {item.strip() for item in skip_source_datasets.split(",") if item.strip()}
-    n = write_sam2_vlm_object_labels(
-        input_jsonl,
-        frames_root,
-        out,
-        extractor=extractor,
-        judge=judge,
-        frame_tag=frame_tag,
-        video_roots=video_roots or None,
-        extracted_frames_dir=extracted_frames_dir,
-        annotated_frames_dir=annotated_frames_dir,
-        skip_source_datasets=skip_sources,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} SAM+VLM object noun entries[/green] → {out}")
-
-
-# ---------- sam2-vlm-label-objects ----------
-
-
-@app.command("sam2-vlm-label-objects")
-def sam2_vlm_label_objects_cmd(
-    input_jsonl: Path = typer.Option(
-        ...,
-        "--input",
-        help="Input JSONL produced by sam2-extract-objects",
-    ),
-    frames_root: Path = typer.Option(
-        Path("data/hf/ego-implicit-ownership-multiperson/frames"),
-        help="Root containing benchmark frame images",
-    ),
-    out: Path = typer.Option(..., help="Output JSONL with VLM object nouns and box positions"),
-    annotated_frames_dir: Path = typer.Option(
-        Path("outputs/sam2_vlm_annotated_frames"),
-        help="Where numbered SAM object-box images are saved for VLM inspection",
-    ),
-    model_id: str = typer.Option(
-        "Qwen/Qwen2.5-VL-7B-Instruct",
-        help="Open-source VLM checkpoint for object noun naming",
-    ),
-    device: str = typer.Option("auto", help="Device for VLM: auto, cpu, cuda:0"),
-    dtype: str = typer.Option("auto", help="Dtype: auto, float16, bfloat16, float32"),
-    max_new_tokens: int = typer.Option(384, help="Maximum generated tokens per VLM judgement"),
-    frame_tag: str = typer.Option("t", help="Sparse frame tag to label: t, t-1, or t-2"),
-    limit: int = typer.Option(0, help="Hard cap on input rows (0 = no cap)"),
-    progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress bar"),
-):
-    """Use a VLM to name SAM-2 object proposals.
-
-    SAM/SAM-2 only proposes generic masks. This stage shows numbered boxes to a
-    VLM and asks it to write object nouns only, without ownership inference.
-    """
-    from egoownership.sam2_objects import FRAME_KEYS
-    from egoownership.sam2_vlm_label import (
-        QwenObjectLabelJudge,
-        QwenObjectLabelJudgeConfig,
-        write_vlm_object_labels,
-    )
-
-    if frame_tag not in FRAME_KEYS:
-        raise typer.BadParameter(f"Unknown --frame-tag {frame_tag!r}. Use t,t-1,t-2")
-
-    judge = QwenObjectLabelJudge(
-        QwenObjectLabelJudgeConfig(
-            model_id=model_id,
-            device=device,
-            dtype=dtype,
-            max_new_tokens=max_new_tokens,
-        )
-    )
-    n = write_vlm_object_labels(
-        input_jsonl,
-        frames_root,
-        out,
-        judge=judge,
-        frame_tag=frame_tag,
-        annotated_frames_dir=annotated_frames_dir,
-        limit=limit if limit > 0 else None,
-        show_progress=progress,
-    )
-    _CONSOLE.print(f"[green]Wrote {n} VLM object noun entries[/green] → {out}")
-
-
-# ---------- new-filter ----------
-
-
-@app.command("new-filter")
-def new_filter_cmd(
-    narration: Path = typer.Option(..., help="Ego4D narration.json path"),
-    taxonomy: str = typer.Option(
-        "C",
-        help="Target taxonomy A/B/C/D, or 'all' for one JSONL with per-clip taxonomy",
-    ),
-    out: Path = typer.Option(..., help="Output JSONL path for reclassified candidates"),
-    require_shared_noun: bool = typer.Option(
-        True, help="Drop candidates whose narration has no shared-table noun"
-    ),
-    limit: int = typer.Option(0, help="Hard cap on output candidates (0 = no cap)"),
-    videos_root: Path = typer.Option(None, help="Directory with {video_id}.mp4 files for frame extraction"),
-    frame_backend: str = typer.Option("ffmpeg", help="Frame extraction backend: ffmpeg or imageio"),
-    frames_out_dir: Path = typer.Option(None, help="Directory to save extracted frames (same layout as extract-frames)"),
-    florence_describe: bool = typer.Option(
-        False,
-        help="After taxonomy pass, run Florence-2 <OD> on sparse frames and merge object labels into nouns",
-    ),
-    florence_model: str = typer.Option("microsoft/Florence-2-base", help="HuggingFace Florence-2 model id"),
-    florence_device: str = typer.Option("", help="Device for Florence-2 (empty = cuda if available else cpu)"),
-    auto_download: bool = typer.Option(False, help="Auto-download missing videos via ego4d CLI when --videos-root is set"),
-    llm_parse: bool = typer.Option(
-        False,
-        help="Use spaCy candidates + OpenAI to pick object/verb and contextual vs baseline",
-    ),
-    openai_model: str = typer.Option(
-        "gpt-4o-mini",
-        help="OpenAI model for --llm-parse (also EGOOWN_NARRATION_OPENAI_MODEL)",
-    ),
-    llm_batch_size: int = typer.Option(
-        20,
-        help="Narrations per OpenAI request when --llm-parse is enabled",
-    ),
-    no_table_object_prefilter: bool = typer.Option(
-        False,
-        help="Do not require 'table' and '#O' in narration (default: require both)",
-    ),
-):
-    """Filter candidates from Ego4D narration.json (narration_pass narrations)."""
-    if taxonomy.lower() in ("all", "*", "any"):
-        tax = None
-    else:
-        try:
-            tax = Taxonomy(taxonomy.upper())
-        except ValueError:
-            raise typer.BadParameter(
-                f"taxonomy must be one of A/B/C/D or 'all', got {taxonomy!r}"
-            )
-
-    n = pipeline.stage_new_filter(
-        narration_path=narration,
-        taxonomy=tax,
-        out_path=out,
-        require_shared_noun=require_shared_noun,
-        limit=limit if limit > 0 else None,
-        videos_root=videos_root,
-        frame_backend=frame_backend,
-        frames_out_dir=frames_out_dir,
-        florence_describe=florence_describe,
-        florence_model=florence_model,
-        florence_device=(florence_device or None),
-        auto_download=auto_download,
-        use_llm_parse=llm_parse,
-        openai_model=openai_model,
-        llm_batch_size=llm_batch_size if llm_parse else None,
-        require_table_object_markers=not no_table_object_prefilter,
-    )
-    if tax is None:
-        _CONSOLE.print(f"[green]Wrote {n} candidates[/green] (split by taxonomy):")
-        for t, path in pipeline.paths_per_taxonomy_out(out).items():
-            _CONSOLE.print(f"  {t.value} → {path}")
-    else:
-        _CONSOLE.print(f"[green]Wrote {n} candidates[/green] → {out}")
-
-
-# ---------- downsample-candidates ----------
-
-
-@app.command("downsample-candidates")
-def downsample_candidates_cmd(
-    inputs: list[Path] = typer.Argument(
-        ...,
-        help="One or more candidates JSONL paths (e.g. outputs/candidates_narration_A.jsonl)",
-    ),
-    window_sec: float = typer.Option(
-        60.0,
-        help="Min seconds between kept clips in the same video_id",
-    ),
-    out: Path = typer.Option(
-        None,
-        help="Output path (single input only). Default: <stem>_ds60.jsonl next to input",
-    ),
-    suffix: str = typer.Option(
-        "",
-        help="Suffix before .jsonl (default: _ds<window>, e.g. _ds60)",
-    ),
-    in_place: bool = typer.Option(
-        False,
-        "--in-place",
-        help="Overwrite input files (destructive; not recommended)",
-    ),
-):
-    """Drop nearby clips in the same video, keeping one per minute window."""
-    if out is not None and len(inputs) != 1:
-        raise typer.BadParameter("--out requires exactly one input JSONL")
-    if in_place and out is not None:
-        raise typer.BadParameter("Use either --in-place or --out, not both")
-    total_before = 0
-    total_after = 0
-    for path in inputs:
-        if not path.exists():
-            raise typer.BadParameter(f"Input not found: {path}")
-        before, after, dest = pipeline.downsample_candidates_jsonl(
-            path,
-            window_sec=window_sec,
-            out_path=out if len(inputs) == 1 else None,
-            in_place=in_place,
-            suffix=suffix or None,
-        )
-        total_before += before
-        total_after += after
-        _CONSOLE.print(
-            f"[green]{path.name}[/green]: {before} → {after} "
-            f"({before - after} removed, window={window_sec}s) → {dest}"
-        )
-    _CONSOLE.print(
-        f"[green]Total[/green]: {total_before} → {total_after} "
-        f"({total_before - total_after} removed)"
-    )
-
-
-# ---------- dedupe-candidates ----------
-
-
-@app.command("dedupe-candidates")
-def dedupe_candidates_cmd(
-    directory: Path = typer.Option(
-        Path("outputs"),
-        help="Directory with candidates_narration_{A,B,C,D}.jsonl split files",
-    ),
-    include_ds60: bool = typer.Option(
-        False,
-        help="Also dedupe candidates_narration_*_ds60.jsonl as a separate group",
-    ),
-    in_place: bool = typer.Option(
-        True,
-        "--in-place/--no-in-place",
-        help="Rewrite taxonomy JSONLs in place (default: True)",
-    ),
-    out_dir: Path = typer.Option(
-        None,
-        help="Write deduped files here instead of in-place",
-    ),
-    window_sec: float = typer.Option(
-        60.0,
-        help="Within each taxonomy file, keep one clip per video_id per this many seconds",
-    ),
-    no_time_downsample: bool = typer.Option(
-        False,
-        help="Skip temporal thinning (narration dedupe only)",
-    ),
-):
-    """Keep one clip per narration, then one per video per minute, across taxonomy JSONLs."""
-    groups = pipeline.discover_taxonomy_candidate_jsonls(
-        directory, include_ds60=include_ds60
-    )
-    if not groups:
-        raise typer.BadParameter(
-            f"No candidates_narration_{{A,B,C,D}}.jsonl under {directory}"
-        )
-    grand_before = 0
-    grand_after = 0
-    for paths in groups:
-        label = paths[0].name.rsplit("_", 2)[0] if paths else "candidates"
-        results = pipeline.dedupe_taxonomy_candidate_jsonls(
-            paths,
-            in_place=in_place and out_dir is None,
-            out_dir=out_dir,
-            window_sec=window_sec,
-            apply_time_downsample=not no_time_downsample,
-        )
-        group_before = sum(b for b, _ in results.values())
-        group_after = sum(a for _, a in results.values())
-        grand_before += group_before
-        grand_after += group_after
-        _CONSOLE.print(f"[bold]{label}[/bold] ({paths[0].parent})")
-        for dest, (before, after) in sorted(results.items(), key=lambda x: x[0].name):
-            _CONSOLE.print(
-                f"  [green]{dest.name}[/green]: {before} → {after} "
-                f"({before - after} removed)"
-            )
-    _CONSOLE.print(
-        f"[green]Total[/green]: {grand_before} → {grand_after} "
-        f"({grand_before - grand_after} removed)"
-    )
 
 
 # ---------- extract-frames ----------
@@ -1737,7 +746,7 @@ def label_cmd(
     _CONSOLE.print(f"[green]Labeled {n} scenes[/green] → {out}")
 
 
-# ---------- serve (collaborative annotator) ----------
+# ---------- convert-to-server ----------
 
 
 @app.command("convert-to-server")
@@ -1753,18 +762,7 @@ def convert_to_server_cmd(
     ),
     progress: bool = typer.Option(True, "--progress/--no-progress"),
 ):
-    """Convert one-pass-labels JSONL to SceneRecord format for the review server.
-
-    Run this once after the one-pass-labels stage, then point 'ego-label serve'
-    at the output file.
-
-    Example workflow:
-
-    \b
-        ego-label convert-to-server --input outputs/egolife/labels.jsonl
-        ego-label serve --scenes outputs/egolife/scene_records.jsonl \\
-                        --frames-root outputs/egolife/one_pass_sparse_frames
-    """
+    """Convert one-pass-labels JSONL to SceneRecord format for the review server."""
     from egoownership.catv_io import count_jsonl, iter_jsonl
     from egoownership.catv_pipeline import labels_row_to_scene_record
 
@@ -1800,10 +798,40 @@ def convert_to_server_cmd(
         _CONSOLE.print(f"[yellow]Skipped {n_err} rows (conversion errors)[/yellow]")
 
 
+# ---------- serve ----------
+
+
 @app.command("serve")
 def serve_cmd(
-    scenes: Path = typer.Option(..., help="Path to scene_records.jsonl"),
-    frames_root: Path = typer.Option(..., help="Root directory frame paths are relative to"),
+    input_jsonl: list[str] = typer.Option(
+        None,
+        "--input",
+        help="labels.jsonl from one-pass-labels. Pass multiple paths — comma-separated "
+             "(--input a.jsonl,b.jsonl) or by repeating the flag (--input a.jsonl --input b.jsonl) "
+             "— to serve multiple datasets in one session: they're merged into one "
+             "scene_records.jsonl, filterable by dataset in the UI. Auto-converts, then serves.",
+    ),
+    scenes: Path = typer.Option(
+        None,
+        help="Path to scene_records.jsonl (SceneRecord format). Use --input instead to serve labels.jsonl directly.",
+    ),
+    scenes_out: Path = typer.Option(
+        None,
+        "--scenes-out",
+        help="Where to write the merged scene_records.jsonl. Defaults to alongside the input file "
+             "(single --input) or outputs/scene_records.jsonl (multiple --input).",
+    ),
+    crosscheck: list[str] = typer.Option(
+        None,
+        "--crosscheck",
+        help="vlm-crosscheck output JSONL(s) to merge in as independent judge second opinions, "
+             "joined by matching id — surfaces alongside the auto evidence in the UI, never "
+             "replacing it. Comma-separated or repeatable, same as --input. Only used with --input.",
+    ),
+    frames_root: Path = typer.Option(
+        None,
+        help="Root directory frame paths are relative to. Defaults to CWD when --input is used.",
+    ),
     videos_root: Path = typer.Option(
         None, help="Optional: directory with {video_id}.mp4 files for clip playback"
     ),
@@ -1813,12 +841,92 @@ def serve_cmd(
 ):
     """Launch the FastAPI collaborative annotation server.
 
-    Open http://HOST:PORT in a browser. Multiple annotators can connect at the
-    same time; edits are written through to ``scenes`` JSONL with file-locking.
-    Pass ``--videos-root`` to enable inline clip playback in the UI.
+    Two usage patterns:
+
+    \b
+        # Direct from one-pass-labels output (recommended), one or more datasets:
+        egoown serve --input outputs/egolife/labels.jsonl
+        egoown serve --input outputs/egolife/labels.jsonl,outputs/ego4d/labels.jsonl
+        egoown serve --input outputs/egolife/labels.jsonl --input outputs/ego4d/labels.jsonl
+
+        # With vlm-crosscheck judgements merged in for side-by-side comparison:
+        egoown serve --input outputs/egolife/labels.jsonl \\
+                     --crosscheck outputs/egolife/claude_crosscheck.jsonl
+
+        # From pre-converted SceneRecord JSONL:
+        egoown serve --scenes outputs/egolife/scene_records.jsonl \\
+                     --frames-root outputs/egolife/one_pass_sparse_frames
     """
     import uvicorn
     from egoownership.server import create_app
+
+    # Accept both --input a --input b and --input a,b (and a mix of the two).
+    inputs: list[Path] = [Path(part.strip()) for raw in (input_jsonl or []) for part in raw.split(",") if part.strip()]
+    crosschecks: list[Path] = [Path(part.strip()) for raw in (crosscheck or []) for part in raw.split(",") if part.strip()]
+
+    if not inputs and scenes is None:
+        raise typer.BadParameter("Provide either --input labels.jsonl (repeatable/comma-separated) or --scenes scene_records.jsonl")
+    if crosschecks and not inputs:
+        raise typer.BadParameter("--crosscheck requires --input (it merges in during labels.jsonl → scene_records.jsonl conversion)")
+
+    if inputs:
+        for p in inputs:
+            if not p.exists():
+                raise typer.BadParameter(f"File not found: {p}")
+        from egoownership.catv_io import count_jsonl, iter_jsonl
+        from egoownership.catv_pipeline import labels_row_to_scene_record
+        from tqdm.auto import tqdm
+
+        crosscheck_by_id: dict[str, dict] = {}
+        for p in crosschecks:
+            if not p.exists():
+                raise typer.BadParameter(f"File not found: {p}")
+            for cc_row in iter_jsonl(p, skip_bad=True):
+                rid = cc_row.get("id")
+                if rid:
+                    crosscheck_by_id[rid] = cc_row
+        if crosschecks:
+            _CONSOLE.print(f"Loaded {len(crosscheck_by_id)} crosscheck judgements from {', '.join(p.name for p in crosschecks)}")
+
+        if scenes_out is not None:
+            scene_records_path = scenes_out
+        elif len(inputs) == 1:
+            scene_records_path = inputs[0].with_name("scene_records.jsonl")
+        else:
+            import os
+
+            common = Path(os.path.commonpath([str(p.resolve().parent) for p in inputs]))
+            scene_records_path = common / "scene_records.jsonl"
+
+        _CONSOLE.print(
+            f"Converting {', '.join(p.name for p in inputs)} → {scene_records_path} …"
+        )
+        n_ok = n_err = n_crosscheck_matched = 0
+        with scene_records_path.open("w", encoding="utf-8") as fh:
+            for src in inputs:
+                for row in tqdm(iter_jsonl(src, skip_bad=True), total=count_jsonl(src), unit="row", desc=src.name):
+                    try:
+                        cc_row = crosscheck_by_id.get(row.get("id")) if crosscheck_by_id else None
+                        if cc_row is not None:
+                            n_crosscheck_matched += 1
+                        fh.write(labels_row_to_scene_record(row, crosscheck=cc_row).model_dump_json() + "\n")
+                        n_ok += 1
+                    except Exception as exc:
+                        n_err += 1
+                        _CONSOLE.print(f"[yellow]skip {row.get('id','?')}: {exc}[/yellow]")
+        _CONSOLE.print(f"[green]{n_ok} records converted[/green]" + (f", {n_err} skipped" if n_err else ""))
+        if crosscheck_by_id:
+            unmatched = len(crosscheck_by_id) - n_crosscheck_matched
+            _CONSOLE.print(
+                f"[cyan]{n_crosscheck_matched}/{n_ok} scene records matched a crosscheck judgement[/cyan]"
+                + (f" [yellow]({unmatched} crosscheck rows had no matching id — check the two files agree on id format)[/yellow]" if unmatched > 0 else "")
+            )
+        scenes = scene_records_path
+        if frames_root is None:
+            frames_root = Path.cwd()
+
+    if frames_root is None:
+        raise typer.BadParameter("--frames-root is required when using --scenes")
 
     fastapi_app = create_app(
         scenes_path=scenes,

@@ -37,6 +37,11 @@
       <input id="search" type="search" placeholder="search clip_id / verb / noun…" />
     </div>
     <div class="filters">
+      <label>dataset
+        <select id="filter-dataset">
+          <option value="">all</option>
+        </select>
+      </label>
       <label>status
         <select id="filter-status">
           <option value="">all</option>
@@ -64,6 +69,14 @@
           <option value="AMBIGUOUS">AMBIGUOUS</option>
         </select>
       </label>
+      <label>vlm agreement
+        <select id="filter-vlm-agreement">
+          <option value="">all</option>
+          <option value="agree">agrees</option>
+          <option value="disagree">disagrees</option>
+          <option value="no_data">no VLM data</option>
+        </select>
+      </label>
       <label>sort
         <select id="filter-sort">
           <option value="default">order in file</option>
@@ -89,6 +102,7 @@
         <span class="badge tax-badge" id="taxonomy-badge"></span>
         <span class="badge status-badge" id="status-badge"></span>
         <span class="badge conf-badge" id="conf-badge"></span>
+        <span class="badge vlm-badge" id="vlm-badge" hidden></span>
         <span class="badge dirty-badge" id="dirty-badge" hidden>unsaved</span>
         <span class="last-saved" id="last-saved"></span>
       </div>
@@ -152,6 +166,14 @@
           <legend>Status</legend>
           <div id="status-buttons"></div>
         </fieldset>
+        <fieldset class="full evidence-control">
+          <legend>Evidence</legend>
+          <div id="evidence-panel"></div>
+        </fieldset>
+        <fieldset class="full vlm-control">
+          <legend>VLM cross-check <small class="hint">independent second opinion</small></legend>
+          <div id="vlm-panel"></div>
+        </fieldset>
         <fieldset class="full">
           <legend>Notes</legend>
           <textarea id="notes" rows="2" placeholder="why this label / edge cases…"></textarea>
@@ -195,6 +217,8 @@
         <div id="stats-label"></div>
         <h4>by taxonomy</h4>
         <div id="stats-taxonomy"></div>
+        <h4>by VLM agreement</h4>
+        <div id="stats-vlm"></div>
       </div>
     </div>
   </aside>

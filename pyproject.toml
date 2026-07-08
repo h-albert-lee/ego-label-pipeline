@@ -19,6 +19,7 @@ dependencies = [
     "numpy>=1.26,<2",
     "tqdm>=4.66",
     "requests>=2.31",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

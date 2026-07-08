@@ -23,14 +23,15 @@ from egoownership.schema import (
     OwnershipLabel,
     SceneRecord,
     Taxonomy,
+    VLMJudgement,
 )
 from egoownership.server import create_app
 
 
-def _record() -> SceneRecord:
+def _record(clip_id: str = "demo:give_pen", *, vlm_majority_label: OwnershipLabel | None = None) -> SceneRecord:
     clip = ClipCandidate(
         dataset="ego4d_fho",
-        clip_id="demo:give_pen",
+        clip_id=clip_id,
         video_id="video_A",
         taxonomy=Taxonomy.CONTEXTUAL,
         t_minus_2_sec=20.0,
@@ -43,14 +44,43 @@ def _record() -> SceneRecord:
     obj = ObjectDetection(label="pen", bbox=bbox, score=0.9, instance_id="pen_1",
                           ownership=OwnershipLabel.SHARED)
     frame = FrameDetections(tag="t", timestamp_sec=21.0, width=640, height=480, objects=[obj])
-    return SceneRecord(clip=clip, frames=[frame], scene_label=OwnershipLabel.SHARED,
-                       auto_label_confidence=0.7)
+    vlm_judgements = {}
+    if vlm_majority_label is not None:
+        vlm_judgements = {
+            "claude-sonnet-4-6": VLMJudgement(
+                model_id="claude-sonnet-4-6",
+                label=vlm_majority_label,
+                agrees=(vlm_majority_label == OwnershipLabel.SHARED),
+            )
+        }
+    return SceneRecord(
+        clip=clip, frames=[frame], scene_label=OwnershipLabel.SHARED,
+        auto_label_confidence=0.7, vlm_judgements=vlm_judgements,
+        vlm_agreement_ratio=1.0 if vlm_majority_label == OwnershipLabel.SHARED else 0.0 if vlm_majority_label else None,
+        vlm_majority_label=vlm_majority_label,
+    )
 
 
 @pytest.fixture
 def client(tmp_path: Path) -> TestClient:
     scenes = tmp_path / "scenes.jsonl"
     scenes.write_text(_record().model_dump_json() + "\n", encoding="utf-8")
+    frames_root = tmp_path / "frames"
+    frames_root.mkdir()
+    app = create_app(scenes_path=scenes, frames_root=frames_root)
+    return TestClient(app)
+
+
+@pytest.fixture
+def client_vlm_mix(tmp_path: Path) -> TestClient:
+    """Three scenes: no VLM data, VLM agrees, VLM disagrees."""
+    scenes = tmp_path / "scenes.jsonl"
+    records = [
+        _record("demo:no_vlm"),
+        _record("demo:vlm_agree", vlm_majority_label=OwnershipLabel.SHARED),
+        _record("demo:vlm_disagree", vlm_majority_label=OwnershipLabel.MINE),
+    ]
+    scenes.write_text("\n".join(r.model_dump_json() for r in records) + "\n", encoding="utf-8")
     frames_root = tmp_path / "frames"
     frames_root.mkdir()
     app = create_app(scenes_path=scenes, frames_root=frames_root)
@@ -152,3 +182,26 @@ def test_next_draft_returns_pending_clip(client: TestClient):
 def test_video_endpoint_returns_404_when_no_videos_root(client: TestClient):
     head = client.head("/video/video_A")
     assert head.status_code == 404
+
+
+def test_list_summaries_expose_vlm_agreement_fields(client_vlm_mix: TestClient):
+    rows = {r["clip_id"]: r for r in client_vlm_mix.get("/api/scenes").json()}
+    assert rows["demo:no_vlm"]["has_vlm_judgement"] is False
+    assert rows["demo:no_vlm"]["vlm_agrees"] is None
+    assert rows["demo:vlm_agree"]["has_vlm_judgement"] is True
+    assert rows["demo:vlm_agree"]["vlm_agrees"] is True
+    assert rows["demo:vlm_disagree"]["vlm_agrees"] is False
+
+
+def test_list_filter_by_vlm_agreement(client_vlm_mix: TestClient):
+    agree = client_vlm_mix.get("/api/scenes?vlm_agreement=agree").json()
+    disagree = client_vlm_mix.get("/api/scenes?vlm_agreement=disagree").json()
+    no_data = client_vlm_mix.get("/api/scenes?vlm_agreement=no_data").json()
+    assert [r["clip_id"] for r in agree] == ["demo:vlm_agree"]
+    assert [r["clip_id"] for r in disagree] == ["demo:vlm_disagree"]
+    assert [r["clip_id"] for r in no_data] == ["demo:no_vlm"]
+
+
+def test_stats_breaks_down_by_vlm_agreement(client_vlm_mix: TestClient):
+    stats = client_vlm_mix.get("/api/stats").json()
+    assert stats["by_vlm_agreement"] == {"no_data": 1, "agree": 1, "disagree": 1}

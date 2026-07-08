@@ -600,7 +600,7 @@ def stage_detect(
                 from egoownership.detection.sam import refine_boxes
                 detections = refine_boxes(fp, detections)
 
-            persons = detect_persons(fp) if detect_persons_too else []
+            persons, _ego_hand_bbox = detect_persons(fp) if detect_persons_too else ([], None)
 
             frames.append(
                 FrameDetections(
@@ -684,7 +684,7 @@ def stage_label(
     """Apply the ownership rule cascade to the detect output.
 
     When ``remote_vlm_judge`` is set (e.g. ``"anthropic"``), each scene also
-    gets a second-opinion VLM label stored in ``scene_record.vlm_judgement``.
+    gets a second-opinion VLM label stored in ``scene_record.vlm_judgements``.
     Requires ``frames_root`` so the VLM can read the actual frame images.
     """
     from egoownership.detection.ownership import assign_ownership, build_scene_record
@@ -721,15 +721,17 @@ def stage_label(
             if len(paths) == len(frames_with_own):
                 try:
                     result = vlm.judge_scene(clip, paths, scene_graph=frames_with_own)
+                    label = OwnershipLabel(result.get("label", "AMBIGUOUS"))
+                    model_id = f"{provider}:{getattr(vlm.cfg, 'model', 'unknown')}"
                     scene = scene.model_copy(update={
-                        "vlm_judgement": VLMJudgement(
-                            provider=provider,
-                            model=getattr(vlm.cfg, "model", "unknown"),
-                            label=OwnershipLabel(result.get("label", "AMBIGUOUS")),
-                            confidence=float(result.get("confidence") or 0.0),
-                            rationale=result.get("rationale"),
-                            target_instance_hint=result.get("target_instance_hint"),
-                        )
+                        "vlm_judgements": {
+                            model_id: VLMJudgement(
+                                model_id=model_id,
+                                label=label,
+                                agrees=(scene.scene_label == label) if scene.scene_label else None,
+                                rationale=result.get("rationale"),
+                            )
+                        }
                     })
                 except Exception as e:  # noqa: BLE001
                     print(f"[warn] VLM judge failed for {clip.clip_id}: {e}")
