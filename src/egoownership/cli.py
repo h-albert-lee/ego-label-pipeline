@@ -190,6 +190,81 @@ def label_cmd(
     _CONSOLE.print(f"[green]Labeled {n} scenes[/green] → {out}")
 
 
+# ---------- vlm-crosscheck (multi-judge label verification) ----------
+
+
+@app.command("vlm-crosscheck")
+def vlm_crosscheck_cmd(
+    input: Path = typer.Option(..., help="labels.jsonl to cross-check"),
+    out: Path = typer.Option(
+        None, help="Output JSONL (default: crosscheck.jsonl next to --input)"
+    ),
+    judge: list[str] = typer.Option(
+        ...,
+        help="Judge spec BACKEND:MODEL_ID (anthropic/openai/gemini/qwen). Repeatable.",
+    ),
+    frames_root: Path = typer.Option(
+        None, help="Root dir for resolving relative frame paths"
+    ),
+    videos_root: Path = typer.Option(
+        None,
+        help="Directory with {video_id}.mp4 — reconstructs sparse frames via ffmpeg "
+        "for metadata-only datasets (e.g. HF-downloaded Ego4D annotations)",
+    ),
+    limit: int = typer.Option(0, help="Max records (0 = all)"),
+    overwrite: bool = typer.Option(False, help="Overwrite output instead of resuming"),
+):
+    """Run independent VLM judges over labels.jsonl and record agreement stats.
+
+    Judges see only the three sparse frames (guideline-v2 prompt); rows are
+    stamped with ``guideline_version``. Example:
+
+        egoown vlm-crosscheck --input outputs/ego4d/labels_v2.jsonl \\
+            --videos-root /data/ego4d/videos --judge anthropic:claude-sonnet-4-6
+    """
+    from egoownership.vlm_crosscheck import write_crosscheck_jsonl
+
+    def _parse_judge(spec: str):
+        from egoownership.vlm_crosscheck import (
+            AnthropicOwnershipJudge,
+            AnthropicOwnershipJudgeConfig,
+            GeminiOwnershipJudge,
+            GeminiOwnershipJudgeConfig,
+            OpenAIOwnershipJudge,
+            OpenAIOwnershipJudgeConfig,
+            QwenOwnershipJudge,
+            QwenOwnershipJudgeConfig,
+        )
+
+        backend, _, model_id = spec.partition(":")
+        backend = backend.lower()
+        model_id = model_id or backend
+        if backend == "anthropic":
+            return AnthropicOwnershipJudge(AnthropicOwnershipJudgeConfig(model_id=model_id))
+        if backend == "openai":
+            return OpenAIOwnershipJudge(OpenAIOwnershipJudgeConfig(model_id=model_id))
+        if backend == "gemini":
+            return GeminiOwnershipJudge(GeminiOwnershipJudgeConfig(model_id=model_id))
+        if backend == "qwen":
+            return QwenOwnershipJudge(QwenOwnershipJudgeConfig(model_id=model_id))
+        raise typer.BadParameter(
+            f"Unknown judge backend {backend!r} — use anthropic, openai, gemini, or qwen."
+        )
+
+    judges = [_parse_judge(s) for s in judge]
+    resolved_out = out or input.with_name("crosscheck.jsonl")
+    n = write_crosscheck_jsonl(
+        input,
+        resolved_out,
+        judges,
+        frames_root=frames_root,
+        videos_root=videos_root,
+        limit=limit if limit > 0 else None,
+        resume=not overwrite,
+    )
+    _CONSOLE.print(f"[green]Cross-checked {n} records[/green] → {resolved_out}")
+
+
 # ---------- serve (collaborative annotator) ----------
 
 

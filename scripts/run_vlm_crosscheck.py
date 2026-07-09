@@ -63,6 +63,9 @@ def main():
     parser.add_argument("--input", required=True, type=Path, help="labels.jsonl from one-pass-labels")
     parser.add_argument("--out", type=Path, default=None, help="Output JSONL (default: next to --input as crosscheck.jsonl)")
     parser.add_argument("--frames-root", type=Path, default=None, help="Root dir for resolving relative frame paths")
+    parser.add_argument("--videos-root", type=Path, default=None,
+                        help="Directory with {video_id}.mp4 — reconstructs sparse frames via ffmpeg "
+                             "for metadata-only datasets (e.g. HF-downloaded Ego4D annotations)")
     parser.add_argument("--judge", action="append", dest="judges", default=[],
                         metavar="BACKEND:MODEL_ID",
                         help="Judge spec, e.g. anthropic:claude-sonnet-4-6. Repeat for multiple judges.")
@@ -86,6 +89,7 @@ def main():
         resolved_out,
         judge_objs,
         frames_root=args.frames_root,
+        videos_root=args.videos_root,
         limit=args.limit if args.limit > 0 else None,
         resume=not args.overwrite,
         show_progress=not args.no_progress,
