@@ -14,6 +14,15 @@ zone_evidence, relation_graph_evidence, context_change_evidence) — the same
 field names used in scene_records.jsonl's auto_key_evidence, so a judge's
 reasoning and the pipeline's own can be compared side-by-side per aspect.
 Each judge's answer is compared to ``auto_ground_truth`` and recorded.
+
+The judge prompt encodes labeling guideline v2 (2026-07-04): ownership is
+distinct from possession (holding/using an object does not decide who owns
+it), plus the boundary rules (place-setting attribution, communal
+persistence, function-first ambiguity, abandonment). Every output row is
+stamped with ``guideline_version`` so rows produced under different
+guideline revisions remain distinguishable. Label definitions are presented
+in a per-record deterministic random order to avoid a fixed-order prior
+toward the first-listed (majority) label.
 """
 
 from __future__ import annotations
@@ -67,17 +76,66 @@ def _canonicalize_label(raw_label: str) -> str | None:
 
 _SYSTEM = (
     "You are an expert annotator for egocentric video understanding. "
-    "You decide who OWNS or primarily uses a highlighted target object "
-    "visible in first-person (ego-camera) footage."
+    "You decide who OWNS a highlighted target object visible in first-person "
+    "(ego-camera) footage. Ownership is not the same as possession: who is "
+    "holding or using the object right now does not by itself decide whose "
+    "it is."
 )
 
-_LABEL_DEFS = """\
-Label definitions:
-  MINE      – the camera wearer (ego) primarily owns / uses this object
-  PERSON_k  – another person in the scene primarily owns / uses this object
-  SHARED    – ownership is genuinely shared between multiple people
-  AMBIGUOUS – impossible to determine from the available evidence
+# Guideline revision encoded in the prompt below. Bump when the labeling
+# guideline changes, so crosscheck rows from different revisions stay
+# distinguishable downstream.
+GUIDELINE_VERSION = "v2-2026-07-04"
+
+# One definition line per label; presented in per-record deterministic random
+# order (see _label_order_for) to avoid a fixed-order prior toward the
+# first-listed label, which is also the majority class.
+_LABEL_DEF_LINES = {
+    "MINE": "MINE      – the object belongs to the camera wearer (ego)",
+    "PERSON_k": "PERSON_k  – the object belongs to another person in the scene",
+    "SHARED": (
+        "SHARED    – a communal item that belongs to no single person "
+        "(inherently shared by function, or by established shared use)"
+    ),
+    "AMBIGUOUS": (
+        "AMBIGUOUS – the visual evidence is insufficient to attribute "
+        "ownership to anyone"
+    ),
+}
+
+_BOUNDARY_RULES = """\
+Apply these boundary rules — they OVERRIDE naive proximity or possession cues:
+  1. Place-setting: tableware set at a person's seat belongs to that person
+     even before they touch it (setting the place counts as first possession).
+  2. Communal persistence: an inherently communal item (serving spoon, shared
+     bottle, serving platter, communal dish) stays SHARED even while one
+     person is holding or using it — transient use does not transfer ownership.
+  3. Function-first ambiguity: an inherently communal-function item defaults
+     to SHARED; a personal-function item (cup, phone, pen) with no attribution
+     cues is AMBIGUOUS.
+  4. Holding is not owning: an object in someone's hand is not automatically
+     theirs — infer whose it is, not who controls it right now.
+  5. Abandonment: pushing one's own item into shared space (e.g. an emptied
+     plate to the table center) does not transfer or void ownership.
 """
+
+
+def _label_order_for(record: dict[str, Any]) -> list[str]:
+    """Deterministic per-record shuffle of label presentation order.
+
+    Seeded by the record id so reruns and resumes present the same order for
+    the same record, while the order varies across records — preventing a
+    systematic first-option prior in judge outputs.
+    """
+    import hashlib
+    import random
+
+    seed = int.from_bytes(
+        hashlib.sha256(str(record.get("id", "")).encode("utf-8")).digest()[:8], "big"
+    )
+    order = ["MINE", "PERSON_k", "SHARED", "AMBIGUOUS"]
+    random.Random(seed).shuffle(order)
+    return order
 
 
 _EVIDENCE_ASPECTS = """\
@@ -88,6 +146,7 @@ frames — don't guess), and answer each in one concise sentence:
   2. Zone                 – where it sits relative to the camera wearer vs. other visible people
      (in the wearer's own space, in someone else's space, or on shared/neutral ground)
   3. Relation              – whose hand (if anyone's) is touching or holding it right now
+     (evidence only — remember that holding is not owning)
   4. Temporal context      – does its position or holder change across t-2 → t-1 → t?
 """
 
@@ -102,10 +161,18 @@ _EVIDENCE_FIELDS = (
 def _build_prompt(record: dict[str, Any]) -> str:
     noun = str((record.get("object") or {}).get("label") or record.get("nouns", ["object"])[0])
 
+    label_order = _label_order_for(record)
+    label_defs = "Label definitions:\n" + "\n".join(
+        f"  {_LABEL_DEF_LINES[label]}" for label in label_order
+    )
+    label_enum = "|".join(label_order)
+
     lines = [
         f"Target object: {noun}",
         "",
-        _LABEL_DEFS,
+        label_defs,
+        "",
+        _BOUNDARY_RULES,
         "You are shown three frames from the video. The target object is boxed in red",
         "wherever its position is reliably known — always in frame t; in t-2/t-1 too",
         "when available, otherwise those are shown without a box (don't assume the",
@@ -118,7 +185,7 @@ def _build_prompt(record: dict[str, Any]) -> str:
         "Respond ONLY with valid JSON (no markdown fences), one sentence per field. "
         "If an aspect isn't determinable from the frames, omit that field entirely — "
         "do not guess or fill it with a placeholder:",
-        '{"label": "<MINE|PERSON_k|SHARED|AMBIGUOUS>", '
+        f'{{"label": "<{label_enum}>", '
         '"object_type_evidence": "<aspect 1, or omit>", '
         '"zone_evidence": "<aspect 2, or omit>", '
         '"relation_graph_evidence": "<aspect 3, or omit>", '
@@ -628,10 +695,14 @@ def write_crosscheck_jsonl(
 
             row = {
                 "id": rid,
+                "guideline_version": GUIDELINE_VERSION,
                 "auto_ground_truth": auto_gt,
                 "judges": judge_results,
                 "agreement_count": agreement_count,
-                "agreement_ratio": round(agreement_count / max(1, len(judge_results)), 4),
+                # Ratio over judges that produced a valid label — ERROR/UNKNOWN
+                # judges shouldn't deflate agreement for the remaining ones.
+                "n_valid_judges": len(labels_predicted),
+                "agreement_ratio": round(agreement_count / max(1, len(labels_predicted)), 4),
                 "majority_label": majority_label,
                 "majority_agrees": majority_label == auto_gt,
             }
