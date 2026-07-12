@@ -18,6 +18,24 @@ extract-bbox -> object-caption -> auto-label -> vlm-crosscheck -> serve
 - `vlm-crosscheck`: optionally ask independent VLM judges to audit labels.
 - `serve`: launch the human review UI.
 
+## Runtime Setup
+
+Install the package in the environment used for the lightweight CLI stages:
+
+```bash
+cd /home/jhlee/ego-label-pipeline
+pip install -e .
+```
+
+Recommended environment split:
+
+- `extract-bbox`: run in the SAM/SAM-3 environment when using `--sam-backend sam3`.
+- `object-caption`: run in the environment that can load SAM-2 and Qwen3-VL.
+- `auto-label`, `vlm-crosscheck`, `serve`: can run in the normal project/test environment.
+
+All stages write JSONL incrementally and support resume by default. Use
+`--overwrite` when you intentionally want to regenerate an output from scratch.
+
 ## Label Space
 
 `MINE`, `PERSON_k`, `SHARED`, `AMBIGUOUS`
@@ -36,11 +54,16 @@ extract-bbox -> object-caption -> auto-label -> vlm-crosscheck -> serve
 EgoLife:
 
 ```bash
+cd /home/jhlee/ego-label-pipeline
+
 egoown extract-bbox \
   --dataset egolife \
   --input data/egolife/tabletop_object_annotations.jsonl \
   --videos-root /data/video_datasets/EgoLife \
-  --out outputs/egolife/bbox_objects.jsonl
+  --out outputs/egolife/bbox_objects.jsonl \
+  --sam-backend sam3 \
+  --sam-model-id facebook/sam3 \
+  --sam-device cuda:0
 
 egoown object-caption \
   --dataset egolife \
@@ -75,12 +98,44 @@ egoown serve \
 Ego4D:
 
 ```bash
+cd /home/jhlee/ego-label-pipeline
+
 egoown extract-bbox \
   --dataset ego4d \
   --input data/ego4d/v2/annotations/narration.json \
   --videos-root /data/video_datasets/Ego4D/v2/full_scale \
-  --out outputs/ego4d/bbox_objects.jsonl
+  --out outputs/ego4d/bbox_objects.jsonl \
+  --sam-backend sam3 \
+  --sam-model-id facebook/sam3 \
+  --sam-device cuda:0
 ```
 
 Then run the same `object-caption`, `auto-label`, `vlm-crosscheck`, and `serve`
 stages with `--dataset ego4d`.
+
+## Outputs
+
+Default per-dataset outputs:
+
+```text
+outputs/{dataset}/bbox_objects.jsonl
+outputs/{dataset}/captions.jsonl
+outputs/{dataset}/labels.jsonl
+outputs/{dataset}/crosscheck.jsonl
+outputs/{dataset}/auto_label_sparse_frames/
+```
+
+Useful review files:
+
+- `bbox_objects.jsonl`: reference object bboxes from the caption frame.
+- `captions.jsonl`: SAM-2 highlighted-object descriptions.
+- `labels.jsonl`: taxonomy, GT label, selected frames, and evidence fields.
+- `crosscheck.jsonl`: optional independent VLM judge outputs.
+
+## Branch
+
+This cleaned pipeline lives on:
+
+```bash
+object-ownership-labeling-pipeline
+```
