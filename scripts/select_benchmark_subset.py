@@ -5,11 +5,13 @@ Reduces a large labels JSONL (e.g. Ego4D ~10k) to a curated eval subset +
 an extended pool, WITHOUT random sampling:
 
 Priority tiers (kept in this order until --target-size is reached):
-  P0  rare-label items (PERSON_k / SHARED / AMBIGUOUS)          -> keep all
-  P1  narration actor is a third person (multi-person signal)    -> keep all
-  P2  MINE decided only by proximity rules (depth/cy evidence)    -> T2/boundary
-      candidates, kept before easy MINE
-  P3  remaining MINE (strong held_by:wearer evidence)             -> quota fill
+  P0  rare-label items (PERSON_k / SHARED / AMBIGUOUS)     -> keep all, conf=high
+  P1  third-person actor + proximity-only MINE             -> rare-class mining
+      pool (likely mislabeled; conf=low, GT proposal = judge majority + human),
+      capped at --p1-frac of target
+  P2  third-person actor, other evidence                    -> conf=low
+  P3  proximity-only MINE, wearer/unknown actor (boundary)  -> conf=medium
+  P4  strong-evidence MINE (held_by:wearer)                 -> conf=high, fill
 
 Constraints applied within every tier:
   --max-per-video      cap clips per source video (near-duplicate control)
@@ -73,11 +75,17 @@ def _tier(rec: dict) -> int:
     label = rec.get("auto_ground_truth") or rec.get("auto_label") or ""
     if label in _RARE_LABELS:
         return 0
-    if _narration_other(rec):
+    proximity = bool(_PROXIMITY_EVIDENCE.search(_evidence_blob(rec)))
+    if _narration_other(rec) and proximity:
+        # Likely-mislabeled MINE (third-person actor + proximity-only rule):
+        # judge-verified rare-class candidates — the class-imbalance goldmine.
+        # These get gt_confidence=low; GT proposal = judge majority + human.
         return 1
-    if _PROXIMITY_EVIDENCE.search(_evidence_blob(rec)):
+    if _narration_other(rec):
         return 2
-    return 3
+    if proximity:
+        return 3
+    return 4
 
 
 def _combo_key(rec: dict) -> tuple:
@@ -97,6 +105,9 @@ def main():
     ap.add_argument("--max-per-video", type=int, default=4)
     ap.add_argument("--max-per-combo", type=int, default=1,
                     help="max clips per (video, verb, noun) combo")
+    ap.add_argument("--p1-frac", type=float, default=0.4,
+                    help="fraction of target reserved for P1 rare-class mining "
+                         "(likely-mislabeled proximity-MINE w/ third-person actor)")
     args = ap.parse_args()
 
     records = list(_iter_jsonl(args.input))
@@ -127,19 +138,30 @@ def main():
         selected.append(rec)
         return True
 
-    # P0/P1: keep all — rare labels & multi-person items are the scarce
-    # resource; caps don't apply (they're already scarce).
-    for t in (0, 1):
-        for rec in tiered[t]:
-            try_take(rec, exempt_caps=True)
+    # P0: rare labels — keep all, caps don't apply (already scarce).
+    for rec in tiered[0]:
+        rec["gt_confidence"] = "high"
+        try_take(rec, exempt_caps=True)
 
-    # P2 then P3: fill up to target under caps.
-    for t in (2, 3):
+    # P1: likely-mislabeled proximity-MINE with third-person actor — the
+    # rare-class mining pool. Capped fill up to --p1-frac of target; these are
+    # flagged low-confidence (GT proposal = judge majority, human confirms).
+    p1_quota = int(args.target_size * args.p1_frac)
+    for rec in tiered[1]:
+        if sum(1 for r in selected if r.get("gt_confidence") == "low") >= p1_quota:
+            break
+        rec["gt_confidence"] = "low"
+        try_take(rec)
+
+    # P2 (other-actor, non-proximity) → P3 (proximity boundary) → P4 (easy
+    # MINE): fill remaining target under caps.
+    conf = {2: "low", 3: "medium", 4: "high"}
+    for t in (2, 3, 4):
         for rec in tiered[t]:
             if len(selected) >= args.target_size:
-                pool.append(rec)
-            elif not try_take(rec):
-                pool.append(rec)
+                break
+            rec["gt_confidence"] = conf[t]
+            try_take(rec)
 
     # Anything past target in earlier loop iterations was appended to pool.
     sel_ids = {id(r) for r in selected}
@@ -160,9 +182,11 @@ def main():
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     sel_labels = Counter((r.get("auto_ground_truth") or r.get("auto_label") or "?") for r in selected)
+    sel_conf = Counter(r.get("gt_confidence", "?") for r in selected)
     n_videos = len({r.get("video_id") or (r.get("clip") or {}).get("video_id") for r in selected})
     print(f"\nselected {len(selected)} rows ({n_videos} videos) -> {args.out}")
     print(f"  label dist: {dict(sel_labels)}")
+    print(f"  confidence dist: {dict(sel_conf)}  (low = judge-majority GT proposal + human confirm)")
     print(f"extended pool {len(pool)} rows -> {pool_out}")
     print("NOTE: extended_pool is the frozen train-split candidate — never eval on it.")
 
