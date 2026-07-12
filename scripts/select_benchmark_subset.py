@@ -54,7 +54,14 @@ def _iter_jsonl(path: Path):
 
 
 def _narration_other(rec: dict) -> bool:
-    narr = rec.get("narration") or (rec.get("clip") or {}).get("narration") or ""
+    # Raw pipeline rows carry `narration`; HF-summary rows (labels_v2) carry the
+    # caption under `dense_caption_en`. Read whichever is present.
+    narr = (
+        rec.get("narration")
+        or (rec.get("clip") or {}).get("narration")
+        or rec.get("dense_caption_en")
+        or ""
+    )
     if not isinstance(narr, str):
         return False
     return narr.lstrip().startswith("#O") or bool(_OTHER_SUBJECT_RE.search(narr))
@@ -69,15 +76,46 @@ def _evidence_blob(rec: dict) -> str:
     return str(ev)
 
 
+def _held_by_t(rec: dict):
+    """Frame-t held_by from the inline scene-record summary (labels_v2), if any."""
+    snaps = ((rec.get("evidence") or {}).get("temporal") or {}).get("frame_snapshots") or {}
+    return (snaps.get("t") or {}).get("held_by")
+
+
+def _is_proximity_mine(rec: dict) -> bool:
+    """MINE decided by a proximity/zone rule rather than a held_by:wearer grab.
+
+    Prefer the raw cascade evidence strings when present; otherwise fall back
+    to the HF summary, where a MINE with no frame-t held_by attribution could
+    only have come from the depth/cy/zone rules (held_by:wearer would have
+    stamped 'wearer').
+    """
+    blob = _evidence_blob(rec)
+    if _PROXIMITY_EVIDENCE.search(blob):
+        return True
+    if "held_by:wearer" in blob or "held_by:person" in blob:
+        return False
+    return _held_by_t(rec) is None
+
+
 def _tier(rec: dict) -> int:
     label = rec.get("auto_ground_truth") or rec.get("auto_label") or ""
     if label in _RARE_LABELS:
         return 0
+    # P2 (proximity/boundary MINE) is the scarce, information-rich mining
+    # target — check it before the generic P1 multi-person bucket, which is
+    # non-discriminative on all-#O slices (every caption is third-person).
+    if _is_proximity_mine(rec):
+        return 2
     if _narration_other(rec):
         return 1
-    if _PROXIMITY_EVIDENCE.search(_evidence_blob(rec)):
-        return 2
     return 3
+
+
+# gt_confidence per tier: proximity/zone MINE (P2) is the low-confidence
+# mining pool whose GT the judges should re-propose; explicit rare-label
+# decisions (P0) and held_by:wearer MINE (P3) are firmer.
+_TIER_CONFIDENCE = {0: "high", 1: "medium", 2: "low", 3: "medium"}
 
 
 def _combo_key(rec: dict) -> tuple:
@@ -105,7 +143,10 @@ def main():
     # Tier everything, then fill greedily under per-video / per-combo caps.
     tiered: dict[int, list[dict]] = defaultdict(list)
     for rec in records:
-        tiered[_tier(rec)].append(rec)
+        t = _tier(rec)
+        rec["subset_tier"] = f"P{t}"
+        rec["gt_confidence"] = _TIER_CONFIDENCE[t]
+        tiered[t].append(rec)
     for t in sorted(tiered):
         labels = Counter((r.get("auto_ground_truth") or r.get("auto_label") or "?") for r in tiered[t])
         print(f"  tier P{t}: {len(tiered[t])} rows  {dict(labels)}")
