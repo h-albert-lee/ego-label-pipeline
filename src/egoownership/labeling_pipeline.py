@@ -1,15 +1,16 @@
-"""Multi-dataset table-object caption construction with SAM/SAM-2 + CAT-V.
+"""Multi-dataset table-object caption construction and ownership labeling.
 
 Pipeline:
 1. Iterate dataset-specific caption/candidate records (EgoLife, Ego4D, …).
 2. Keep records mentioning a table and at least one concrete table-top noun.
 3. Extract a reference frame and run SAM/SAM-3 for object boxes.
-4. For each selected object box, call a CAT-V subprocess adapter to create an
-   object-centric caption.
+4. For each selected object box, create an object-centric caption from a
+   SAM-2-highlighted video.
 5. Optionally build sparse benchmark frames and ownership labels.
 
-CAT-V is a separate research repo with its own environment, so this module
-uses a command template instead of importing CAT-V directly.
+The heavy SAM-2 step runs as a batch subprocess so the tracker is loaded once.
+The VLM captioner runs in-process on a single machine and keeps the model loaded
+for all captioning rows.
 """
 
 from __future__ import annotations
@@ -30,21 +31,34 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from egoownership.catv_datasets import (
-    CatVDatasetAdapter,
-    get_catv_dataset_adapter,
+from egoownership.datasets.adapters import (
+    LabelingDatasetAdapter,
+    get_dataset_adapter,
     normalize_dataset_id,
     resolve_egolife_video_path,
     resolve_egolife_video_segment,
 )
-from egoownership.catv_io import (
-    count_jsonl,
-    iter_jsonl,
-    normalize_object_noun,
-    safe_path_part,
-)
-from egoownership.sam2_objects import Sam2ObjectExtractor, _nms_objects
+from egoownership.config import normalize_object_noun, safe_path_part
+from egoownership.detection.object_segmentation import Sam2ObjectExtractor, _nms_objects
 from egoownership.schema import BBox
+
+
+def iter_jsonl(path: Path, *, skip_bad: bool = False) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                if not skip_bad:
+                    raise
+
+
+def count_jsonl(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
 @dataclass
@@ -131,7 +145,7 @@ _SAM3_REFINE_CONFIDENCE_FLOOR = 0.5
 
 @lru_cache(maxsize=2)
 def _sam3_refine_extractor(model_id: str) -> Sam2ObjectExtractor:
-    from egoownership.sam2_objects import Sam2ObjectConfig
+    from egoownership.detection.object_segmentation import Sam2ObjectConfig
 
     return Sam2ObjectExtractor(Sam2ObjectConfig(model_id=model_id, backend="sam3"))
 
@@ -167,12 +181,12 @@ def _refine_object_bbox_with_sam3(
 
 
 def _caption_describes_target(object_caption: str, target_noun: str) -> bool:
-    """Check whether CAT-V's caption is actually about the row's target object.
+    """Check whether the caption is actually about the row's target object.
 
-    CAT-V's caption is generated from a SAM2-masked video and can drift onto
-    the wrong object (e.g. target_noun="phone" but the caption describes "a
-    piece of paper"). The prompt always asks for an "HO: <description>" first
-    line, so compare the target noun against just that line when present.
+    The caption is generated from a SAM-2-masked video and can drift onto the
+    wrong object (e.g. target_noun="phone" but the caption describes "a piece
+    of paper"). The prompt always asks for an "HO: <description>" first line,
+    so compare the target noun against just that line when present.
     """
     target = str(target_noun or "").strip().lower().replace("_", " ")
     if not target or target in {"object", "sam2_object", "sam2 object"}:
@@ -193,7 +207,7 @@ def write_one_pass_labels(
     descriptions_path: Path,
     out_path: Path,
     *,
-    frames_dir: Path = Path("outputs/one_pass_sparse_frames"),
+    frames_dir: Path = Path("outputs/auto_label_sparse_frames"),
     detect_persons: bool = False,
     decision_fn: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
     sam3_model_id: str | None = None,
@@ -205,7 +219,7 @@ def write_one_pass_labels(
     resume: bool = True,
     show_progress: bool = True,
     dataset: str | None = None,
-    progress_desc: str = "CAT-V one-pass labels",
+    progress_desc: str = "auto-label",
 ) -> int:
     return _write_one_pass_labels_impl(
         descriptions_path,
@@ -226,36 +240,6 @@ def write_one_pass_labels(
     )
 
 
-def write_egolife_one_pass_labels(
-    descriptions_path: Path,
-    out_path: Path,
-    *,
-    frames_dir: Path = Path("outputs/egolife_one_pass_sparse_frames"),
-    detect_persons: bool = False,
-    decision_fn: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
-    review_dir: Path | None = None,
-    review_max_width: int = 900,
-    limit: int | None = None,
-    resume: bool = True,
-    show_progress: bool = True,
-) -> int:
-    """Backward-compatible wrapper for EgoLife one-pass labeling."""
-    return write_one_pass_labels(
-        descriptions_path,
-        out_path,
-        frames_dir=frames_dir,
-        detect_persons=detect_persons,
-        decision_fn=decision_fn,
-        review_dir=review_dir,
-        review_max_width=review_max_width,
-        limit=limit,
-        resume=resume,
-        show_progress=show_progress,
-        dataset="egolife",
-        progress_desc="EgoLife one-pass labels",
-    )
-
-
 def _write_one_pass_labels_impl(
     descriptions_path: Path,
     out_path: Path,
@@ -272,12 +256,12 @@ def _write_one_pass_labels_impl(
     resume: bool = True,
     show_progress: bool = True,
     dataset: str | None = None,
-    progress_desc: str = "CAT-V one-pass labels",
+    progress_desc: str = "auto-label",
 ) -> int:
     """Attach sparse benchmark frames and labels to existing object descriptions.
 
-    ``descriptions_path`` is the JSONL produced by the bbox/CAT-V stage. This
-    function intentionally does not run CAT-V. It treats the existing
+    ``descriptions_path`` is the JSONL produced by the bbox/object-caption
+    stage. This function intentionally does not run the captioner. It treats the existing
     ``object_caption`` as the grounded object-description source. When an
     ``extractor`` is provided, it uses the previous frame-selection criterion:
     sample the caption interval, keep frames where the target object is visible,
@@ -295,7 +279,7 @@ def _write_one_pass_labels_impl(
     if review_dir is not None:
         review_dir.mkdir(parents=True, exist_ok=True)
 
-    from egoownership.catv_evidence_label import build_evidence_label
+    from egoownership.evidence_labeling import build_evidence_label
 
     person_detector = None
     if detect_persons:
@@ -431,12 +415,12 @@ def _write_one_pass_labels_impl(
     return count
 
 
-def write_catv_captions_batch(
+def write_object_captions(
     input_path: Path,
     out_path: Path,
     *,
     mask_model_path: str = "facebook/sam2.1-hiera-base-plus",
-    catv_device: str = "cuda:0",
+    caption_device: str = "cuda:0",
     devices: list[str] | None = None,
     fps: float = 1.0,
     whole_video: bool = True,
@@ -444,45 +428,41 @@ def write_catv_captions_batch(
     max_side: int = 448,
     captioner_backend: str = "qwen3vl",
     caption_model_path: str = "Qwen/Qwen3-VL-8B-Instruct",
-    qwen_vl_python: str | None = None,
-    catv_python: str | None = None,
+    mask_python: str | None = None,
     visualization_root: Path | None = None,
-    batch_jobs_dir: Path | None = None,
+    work_dir: Path | None = None,
     limit: int | None = None,
     resume: bool = True,
     show_progress: bool = True,
 ) -> int:
-    """Batch-mode CAT-V captioning: load SAM-2 once, load the VLM once.
+    """Caption object boxes with SAM-2 masking and one in-process VLM run.
 
-    Rather than spawning a fresh process per row (which would reload both
-    models every time), this function:
+    Rather than spawning a fresh captioning process per row (which would reload
+    the VLM every time), this function:
 
     1. Prepares all clip/bbox inputs with ffmpeg (fast, no GPU).
     2. Calls batch_sam2_mask.py once — SAM-2 loaded a single time for all rows.
-    3. Calls batch_qwen_vl_caption.py once — VLM loaded a single time for all rows.
+    3. Runs Qwen3-VL in this process — VLM loaded a single time for all rows.
     4. Collects all outputs and writes the result JSONL.
-
-    With 183 rows the per-row approach wastes ~1.5h (SAM-2) + ~3h (Qwen3-VL) in
-    model I/O alone; batch mode reduces that to a one-time ~90s load.
     """
     if not input_path.exists():
         raise FileNotFoundError(f"BBox JSONL not found: {input_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    jobs_dir = (batch_jobs_dir or out_path.parent / "catv_batch_jobs").resolve()
+    jobs_dir = (work_dir or out_path.parent / "labeling_work").resolve()
     jobs_dir.mkdir(parents=True, exist_ok=True)
     sam2_jobs_path = jobs_dir / "sam2_jobs.jsonl"
     vl_jobs_path = jobs_dir / "vl_jobs.jsonl"
 
-    effective_device = (devices[0] if devices else None) or catv_device
+    effective_device = (devices[0] if devices else None) or caption_device
     work_root = jobs_dir / "work"
     work_root.mkdir(parents=True, exist_ok=True)
-    return _write_catv_captions_batch_in_workdir(
+    return _write_object_captions_in_workdir(
             input_path=input_path,
             out_path=out_path,
             work_root=work_root,
             mask_model_path=mask_model_path,
-            catv_device=effective_device,
+            caption_device=effective_device,
             devices=devices,
             fps=fps,
             whole_video=whole_video,
@@ -490,8 +470,7 @@ def write_catv_captions_batch(
             max_side=max_side,
             captioner_backend=captioner_backend,
             caption_model_path=caption_model_path,
-            qwen_vl_python=qwen_vl_python,
-            catv_python=catv_python,
+            mask_python=mask_python,
             visualization_root=visualization_root,
             sam2_jobs_path=sam2_jobs_path,
             vl_jobs_path=vl_jobs_path,
@@ -500,13 +479,13 @@ def write_catv_captions_batch(
             show_progress=show_progress,
         )
 
-def _write_catv_captions_batch_in_workdir(
+def _write_object_captions_in_workdir(
     *,
     input_path: Path,
     out_path: Path,
     work_root: Path,
     mask_model_path: str,
-    catv_device: str,
+    caption_device: str,
     devices: list[str] | None = None,
     fps: float,
     whole_video: bool,
@@ -514,8 +493,7 @@ def _write_catv_captions_batch_in_workdir(
     max_side: int,
     captioner_backend: str,
     caption_model_path: str,
-    qwen_vl_python: str,
-    catv_python: str | None,
+    mask_python: str | None,
     visualization_root: Path | None,
     sam2_jobs_path: Path,
     vl_jobs_path: Path,
@@ -531,7 +509,7 @@ def _write_catv_captions_batch_in_workdir(
     if limit is not None:
         records_all = records_all[:limit]
 
-    effective_devices = devices if devices else [catv_device]
+    effective_devices = devices if devices else [caption_device]
 
     if show_progress:
         print(f"[batch_captioning] {len(records_all)} total rows, {len(existing_ids)} already done", flush=True)
@@ -649,12 +627,12 @@ def _write_catv_captions_batch_in_workdir(
         f"[batch_captioning] Phase 2: SAM-2 tracking ({len(sam2_jobs)} jobs, {n_sam2_gpus} GPU(s)) …",
         flush=True,
     )
-    catv_py = catv_python or qwen_vl_python or sys.executable
+    mask_py = mask_python or sys.executable
     batch_sam2_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_sam2_mask.py"
     if n_sam2_gpus == 1:
         _run_batch_subprocess(
             [
-                catv_py,
+                mask_py,
                 str(batch_sam2_script),
                 "--jobs", str(sam2_jobs_path),
                 "--model-path", str(mask_model_path),
@@ -680,7 +658,7 @@ def _write_catv_captions_batch_in_workdir(
             try:
                 _run_batch_subprocess(
                     [
-                        catv_py,
+                        mask_py,
                         str(batch_sam2_script),
                         "--jobs", str(shard_path),
                         "--model-path", str(mask_model_path),
@@ -728,64 +706,25 @@ def _write_catv_captions_batch_in_workdir(
         encoding="utf-8",
     )
 
-    # --- Phase 4: Run Qwen3-VL batch captioner ---
+    # --- Phase 4: Run Qwen3-VL captioner in this process ---
     if captioner_backend == "qwen3vl":
-        batch_vl_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "batch_qwen_vl_caption.py"
-        vl_python = qwen_vl_python or sys.executable
-        n_gpus = len(effective_devices)
+        if len(effective_devices) > 1:
+            print(
+                f"[batch_captioning] Qwen in-process captioning uses one device; using {effective_devices[0]}",
+                flush=True,
+            )
         print(
-            f"[batch_captioning] Phase 4: Qwen3-VL captioning ({len(vl_jobs)} jobs, {n_gpus} GPU(s)) …",
+            f"[batch_captioning] Phase 4: Qwen3-VL captioning ({len(vl_jobs)} jobs on {effective_devices[0]}) …",
             flush=True,
         )
-        if n_gpus == 1:
-            _run_batch_subprocess(
-                [vl_python, str(batch_vl_script),
-                 "--jobs", str(vl_jobs_path),
-                 "--model-path", caption_model_path,
-                 "--device", effective_devices[0]],
-                label="batch_qwen_vl_caption",
-                progress_paths=[Path(j["out_json"]) for j in vl_jobs],
-                progress_desc="Phase 4 Qwen",
-            )
-        else:
-            import math
-            import threading
-            chunk_size = math.ceil(len(vl_jobs) / n_gpus)
-            errors: list[Exception] = []
-            threads: list[threading.Thread] = []
-
-            def _run_shard(shard_jobs: list[dict], device: str, shard_path: Path) -> None:
-                shard_path.write_text(
-                    "\n".join(json.dumps(j, ensure_ascii=False) for j in shard_jobs) + "\n",
-                    encoding="utf-8",
-                )
-                try:
-                    _run_batch_subprocess(
-                        [vl_python, str(batch_vl_script),
-                         "--jobs", str(shard_path),
-                         "--model-path", caption_model_path,
-                         "--device", device],
-                        label=f"batch_qwen_vl_caption[{device}]",
-                        progress_paths=[Path(j["out_json"]) for j in shard_jobs],
-                        progress_desc=f"Phase 4 Qwen {device}",
-                    )
-                except Exception as exc:
-                    errors.append(exc)
-
-            for i, device in enumerate(effective_devices):
-                shard = vl_jobs[i * chunk_size: (i + 1) * chunk_size]
-                if not shard:
-                    continue
-                shard_path = vl_jobs_path.parent / f"vl_jobs_shard{i}.jsonl"
-                t = threading.Thread(target=_run_shard, args=(shard, device, shard_path), daemon=True)
-                threads.append(t)
-                t.start()
-            for t in threads:
-                t.join()
-            if errors:
-                raise errors[0]
+        _caption_qwen3vl_jobs(
+            vl_jobs,
+            model_path=caption_model_path,
+            device=effective_devices[0],
+            show_progress=show_progress,
+        )
     else:
-        raise NotImplementedError(f"Batch mode not yet implemented for backend: {captioner_backend!r}")
+        raise NotImplementedError(f"Caption backend not implemented: {captioner_backend!r}")
 
     # --- Phase 5: Collect results and write output JSONL ---
     print("[batch_captioning] Phase 5: collecting results …", flush=True)
@@ -810,14 +749,14 @@ def _write_catv_captions_batch_in_workdir(
             if not caption_json_path.exists():
                 continue
             try:
-                catv_output = json.loads(caption_json_path.read_text(encoding="utf-8"))
+                caption_output = json.loads(caption_json_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            caption = _extract_caption_from_json(catv_output)
+            caption = _extract_caption_from_json(caption_output)
             if not caption:
                 continue
 
-            relative_timestamps = catv_output.get("frame_timestamps_sec") or []
+            relative_timestamps = caption_output.get("frame_timestamps_sec") or []
             clip_origin_sec = 0.0 if whole_video else float(record.get("catv_start_sec") or 0.0)
             described_frame_timestamps_sec = [clip_origin_sec + t for t in relative_timestamps]
 
@@ -877,6 +816,133 @@ def _ownership_relevant_question(target_noun: str = "") -> str:
         "Do not describe HO's appearance, surroundings, or unrelated objects beyond what is needed to answer "
         "these four questions."
     )
+
+
+def _resize_frame_for_vlm(image: Image.Image, max_side: int) -> Image.Image:
+    width, height = image.size
+    scale = max_side / max(width, height)
+    if scale >= 1.0:
+        return image
+    return image.resize((max(1, round(width * scale)), max(1, round(height * scale))))
+
+
+def _extract_video_frames_for_vlm(
+    video_path: Path,
+    *,
+    max_frames: int,
+    max_side: int,
+) -> tuple[list[Image.Image], list[float]]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    raw_frames: list[Image.Image] = []
+    kept_source_indices: list[int] = []
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        raw_frames.append(
+            _resize_frame_for_vlm(
+                Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
+                max_side,
+            )
+        )
+        kept_source_indices.append(frame_idx)
+        frame_idx += 1
+    cap.release()
+    if not raw_frames:
+        raise FileNotFoundError(f"No frames decoded from {video_path}")
+    if len(raw_frames) > max_frames:
+        step = len(raw_frames) / max_frames
+        selected_indices = [int(i * step) for i in range(max_frames)]
+        raw_frames = [raw_frames[i] for i in selected_indices]
+        kept_source_indices = [kept_source_indices[i] for i in selected_indices]
+    timestamps = [idx / fps for idx in kept_source_indices]
+    return raw_frames, timestamps
+
+
+def _caption_qwen3vl_one(model: Any, processor: Any, job: dict[str, Any], *, device: str) -> None:
+    import torch
+
+    masked_video = Path(job["masked_video"])
+    out_json = Path(job["out_json"])
+    max_frames = int(job.get("max_frames", 16))
+    max_side = int(job.get("max_side", 448))
+    max_new_tokens = int(job.get("max_new_tokens", 512))
+
+    frames, timestamps = _extract_video_frames_for_vlm(masked_video, max_frames=max_frames, max_side=max_side)
+    frame_content: list[dict[str, Any]] = []
+    for index, frame in enumerate(frames, start=1):
+        frame_content.append({"type": "text", "text": f"Frame{index}:"})
+        frame_content.append({"type": "image", "image": frame})
+    messages = [{"role": "user", "content": [*frame_content, {"type": "text", "text": job["question"]}]}]
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    prompt_len = inputs["input_ids"].shape[1]
+    text = processor.batch_decode(output_ids[:, prompt_len:], skip_special_tokens=True)[0].strip()
+
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(
+        json.dumps({"model_answer": text, "frame_timestamps_sec": timestamps}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _caption_qwen3vl_jobs(
+    jobs: list[dict[str, Any]],
+    *,
+    model_path: str,
+    device: str,
+    show_progress: bool,
+) -> None:
+    if not jobs:
+        return
+
+    import torch
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = (
+        Qwen3VLForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+        .to(device)
+        .eval()
+    )
+
+    iterator: Iterable[dict[str, Any]] = jobs
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(jobs, desc="Phase 4 Qwen", unit="row", dynamic_ncols=True)
+
+    for job in iterator:
+        out_json = Path(job["out_json"])
+        if out_json.exists() and out_json.stat().st_size > 0:
+            continue
+        try:
+            _caption_qwen3vl_one(model, processor, job, device=device)
+        except Exception as exc:
+            out_json.parent.mkdir(parents=True, exist_ok=True)
+            out_json.write_text(
+                json.dumps(
+                    {
+                        "model_answer": "<error_processing>",
+                        "frame_timestamps_sec": [],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
 
 
 def _probe_video_wh(video_path: Path) -> tuple[int, int]:
@@ -965,7 +1031,7 @@ def write_caption_bboxes(
     *,
     dataset: str,
     extractor: Sam2ObjectExtractor | Callable[[Path], list[dict[str, Any]]],
-    frames_dir: Path = Path("outputs/catv_first_frames_objectlist"),
+    frames_dir: Path = Path("outputs/reference_frames_objectlist"),
     object_nouns_path: Path | None = None,
     max_objects_per_record: int = 5,
     reference_frame: str = "midpoint",
@@ -979,7 +1045,7 @@ def write_caption_bboxes(
     """Extract target-object boxes from table-caption records for any supported dataset."""
     adapter_kwargs: dict[str, Any] = {}
     if normalize_dataset_id(dataset) == "ego4d_fho":
-        from egoownership.ego4d_video import DEFAULT_CLIP_WINDOW_SEC
+        from egoownership.datasets.ego4d_source import DEFAULT_CLIP_WINDOW_SEC
 
         adapter_kwargs = {
             "ego4d_clip_window_sec": ego4d_clip_window_sec
@@ -988,7 +1054,7 @@ def write_caption_bboxes(
             "ego4d_auto_download": ego4d_auto_download,
             "ego4d_require_observer": ego4d_require_observer,
         }
-    adapter = get_catv_dataset_adapter(dataset, **adapter_kwargs)
+    adapter = get_dataset_adapter(dataset, **adapter_kwargs)
     if not annotations_path.exists():
         raise FileNotFoundError(f"Annotations path not found: {annotations_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1086,38 +1152,6 @@ def write_caption_bboxes(
     return count
 
 
-def write_egolife_caption_bboxes(
-    annotations_path: Path,
-    videos_root: Path,
-    out_path: Path,
-    *,
-    extractor: Sam2ObjectExtractor | Callable[[Path], list[dict[str, Any]]],
-    frames_dir: Path = Path("outputs/egolife_catv_first_frames_objectlist"),
-    object_nouns_path: Path | None = None,
-    max_objects_per_record: int = 5,
-    reference_frame: str = "midpoint",
-    limit: int | None = None,
-    resume: bool = True,
-    show_progress: bool = True,
-) -> int:
-    """Backward-compatible wrapper for EgoLife bbox extraction."""
-    return write_caption_bboxes(
-        annotations_path,
-        videos_root,
-        out_path,
-        dataset="egolife",
-        extractor=extractor,
-        frames_dir=frames_dir,
-        object_nouns_path=object_nouns_path,
-        max_objects_per_record=max_objects_per_record,
-        reference_frame=reference_frame,
-        limit=limit,
-        resume=resume,
-        show_progress=show_progress,
-    )
-
-
-
 def _keep_only_reference_frame_fields(row: dict[str, Any], *, target_frame: Path, target_sec: float) -> None:
     for key in (
         "frame_paths",
@@ -1179,7 +1213,7 @@ def _jsonl_sparse_frame_times(record: dict[str, Any]) -> dict[str, float]:
     """Pick t-2/t-1/t anchored on the frame the target object was actually
     detected on.
 
-    ``reference_frame_sec`` (set by the extract-bboxes stage from the SAM-3
+    ``reference_frame_sec`` (set by the extract-bbox stage from the SAM-3
     detection frame) is authoritative: it's what object.bbox, the object
     caption, and the reference frame image all correspond to. Picking t-2/t-1/t
     independently from described_frame_timestamps_sec's first/middle/last (the
@@ -1250,10 +1284,10 @@ def _build_bbox_row(
     window_duration = record.get("source_window_duration_sec")
     if window_duration is not None:
         caption_duration = max(0.1, float(window_duration))
-        catv_start = 0.0
+        caption_start = 0.0
     else:
         caption_duration = max(1.0, float(record.get("end_sec") or 0.0) - float(record.get("start_sec") or 0.0))
-        catv_start = target_sec
+        caption_start = target_sec
     return {
         "id": f"{record['id']}#obj{object_index}",
         "clip_id": record["clip_id"],
@@ -1274,8 +1308,8 @@ def _build_bbox_row(
         "frame_t_minus_1_path": str(frame_paths["t-1"]),
         "frame_t_path": str(frame_paths["t"]),
         "source_video_start_sec": video_start_sec,
-        "catv_start_sec": catv_start,
-        "catv_end_sec": catv_start + caption_duration,
+        "catv_start_sec": caption_start,
+        "catv_end_sec": caption_start + caption_duration,
         "catv_duration_sec": caption_duration,
         "dense_caption": record.get("dense_caption"),
         "dense_caption_en": record.get("dense_caption_en"),
@@ -1307,7 +1341,7 @@ def iter_filtered_table_object_caption_records(
     object_nouns: set[str] | None = None,
     dataset: str = "egolife",
 ) -> Iterable[dict[str, Any]]:
-    adapter = get_catv_dataset_adapter(dataset)
+    adapter = get_dataset_adapter(dataset)
     yield from adapter.iter_caption_records(path, object_nouns=object_nouns)
 
 
@@ -1330,7 +1364,7 @@ def load_object_noun_allowlist(path: Path | None) -> set[str] | None:
 def _record_storage_parts(record: dict[str, Any]) -> tuple[str, str]:
     dataset = str(record.get("source_dataset") or record.get("dataset") or "egolife")
     try:
-        adapter = get_catv_dataset_adapter(dataset)
+        adapter = get_dataset_adapter(dataset)
         return adapter.storage_parts(record)
     except ValueError:
         if record.get("participant") and record.get("day"):
@@ -1399,7 +1433,7 @@ def select_frames_from_citation(
     position/state changes between FIRST/KEY/FINAL, so a static bbox would
     make every frame's zone identical and silently zero out the temporal
     ownership signals (object_moved, held_by_changed, zone_changed, ...) that
-    ``catv_evidence_label._build_temporal_evidence`` derives from them.
+    ``evidence_labeling._build_temporal_evidence`` derives from them.
     """
     citation = _parse_frame_citation(record.get("object_caption"))
     timestamps = record.get("described_frame_timestamps_sec")
@@ -1465,7 +1499,7 @@ def select_visibility_aware_sparse_frames(
     # Scope detection/filtering to this row's own object noun. ``record["nouns"]``
     # is the whole caption's noun list (e.g. multiple objects share one caption);
     # reusing it here would let a different object's box win re-selection and
-    # silently overwrite this row's bbox/label (see one-pass-labels cross-noun bug).
+    # silently overwrite this row's bbox/label (see auto-label cross-noun bug).
     noun_record = {**record, "nouns": [target_noun]} if target_noun else record
     visible: list[tuple[int, float, Path, list[dict[str, Any]]]] = []
     with tempfile.TemporaryDirectory(prefix="egolife_visibility_probe_") as scratch_dir:
@@ -2005,7 +2039,7 @@ def render_annotation_review_image(row: dict[str, Any], *, max_width: int = 900)
     """Lay the t-2/t-1/t frames out in a single row with a caption panel below.
 
     The panel reports the auto taxonomy/ground-truth decision, the supporting
-    evidence used by ``build_evidence_label``, and the CAT-V object caption in
+    evidence used by ``build_evidence_label``, and the object caption in
     clearly separated, legible sections so a human reviewer can sanity-check
     the auto-label without leaving the image viewer.
     """
@@ -2052,7 +2086,7 @@ def render_annotation_review_image(row: dict[str, Any], *, max_width: int = 900)
     )
     add_line("RATIONALE", font_header, (90, 90, 90), gap_after=2)
     add_line(row.get("auto_rationale") or "(none)", font_body, (20, 20, 20), gap_after=10)
-    add_line("CAT-V CAPTION", font_header, (90, 90, 90), gap_after=2)
+    add_line("OBJECT CAPTION", font_header, (90, 90, 90), gap_after=2)
     caption_text = row.get("object_caption") or row.get("dense_caption_en") or "(none)"
     add_line(caption_text, font_body, (20, 20, 20), gap_after=0)
 
@@ -2079,7 +2113,7 @@ def write_annotation_review_images(
     resume: bool = True,
     show_progress: bool = True,
 ) -> int:
-    """Render one review composite per row of a one-pass-labels JSONL."""
+    """Render one review composite per row of a auto-label JSONL."""
     if not input_path.exists():
         raise FileNotFoundError(f"Label JSONL not found: {input_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2088,7 +2122,7 @@ def write_annotation_review_images(
     if show_progress:
         from tqdm.auto import tqdm
 
-        records = tqdm(records, total=count_jsonl(input_path), unit="row", desc="CAT-V review images")
+        records = tqdm(records, total=count_jsonl(input_path), unit="row", desc="label review images")
 
     count = 0
     processed = 0
@@ -2131,7 +2165,7 @@ write_egolife_annotation_review_images = write_annotation_review_images
 
 
 def _build_server_evidence(row: dict[str, Any], stored_evidence: dict[str, Any] | None, obj_label: str, rationale: str) -> dict[str, Any]:
-    from egoownership.catv_evidence_label import _build_key_evidence, _sentence
+    from egoownership.evidence_labeling import _build_key_evidence, _sentence
 
     stored_evidence = stored_evidence or {}
     key_evidence = _build_key_evidence(row, stored_evidence, fallback_label=obj_label)
@@ -2147,7 +2181,7 @@ def _build_server_evidence(row: dict[str, Any], stored_evidence: dict[str, Any] 
 
 
 def labels_row_to_scene_record(row: dict[str, Any], *, crosscheck: dict[str, Any] | None = None) -> "SceneRecord":
-    """Convert one labels.jsonl row (from one-pass-labels) to a SceneRecord for the server.
+    """Convert one labels.jsonl row (from auto-label) to a SceneRecord for the server.
 
     ``crosscheck``, when given, is the matching row from a vlm-crosscheck output
     file (keyed by the same ``id``) — its independent judge labels/evidence are
@@ -2215,15 +2249,15 @@ def labels_row_to_scene_record(row: dict[str, Any], *, crosscheck: dict[str, Any
 
     # ---- evidence strings (shown in server's instance-evidence panel) ----
     # Re-run the decision function on stored evidence to get up-to-date prose rationale,
-    # even when labels.jsonl was generated by an older version of catv_evidence_label.
-    from egoownership.catv_evidence_label import _sentence
+    # even when labels.jsonl was generated by an older version of evidence_labeling.
+    from egoownership.evidence_labeling import _sentence
 
     evidence_strings: list[str] = []
     stored_evidence = row.get("evidence")
     rationale = row.get("auto_rationale") or ""
     if stored_evidence:
         try:
-            from egoownership.catv_evidence_label import _decide_taxonomy_gt
+            from egoownership.evidence_labeling import _decide_taxonomy_gt
             fresh = _decide_taxonomy_gt(row, stored_evidence)
             rationale = fresh.get("rationale") or rationale
         except Exception:
@@ -2412,3 +2446,54 @@ def labels_row_to_scene_record(row: dict[str, Any], *, crosscheck: dict[str, Any
         vlm_agreement_ratio=vlm_agreement_ratio,
         vlm_majority_label=vlm_majority_label,
     )
+
+
+def load_preserved_review_state(scene_records_path: "Path") -> dict[str, "SceneRecord"]:
+    """Load existing scene_records.jsonl records worth protecting from a re-conversion.
+
+    A record with edit history or a non-draft review_status represents a real
+    decision — by a human, or by a batch operation like validation sampling —
+    that a bare re-run of ``egoown serve --input ...`` must not silently wipe
+    back to a blank draft. Records that were never touched aren't returned,
+    since letting a fresh conversion overwrite them (e.g. to pick up a
+    labels.jsonl bugfix) is exactly the point of re-running the conversion.
+    """
+    from egoownership.schema import SceneRecord
+
+    preserved: dict[str, SceneRecord] = {}
+    if not scene_records_path.exists():
+        return preserved
+    for raw_record in iter_jsonl(scene_records_path, skip_bad=True):
+        try:
+            rec = SceneRecord.model_validate(raw_record)
+        except Exception:
+            continue
+        if rec.edits or rec.review_status != "draft":
+            preserved[rec.clip.clip_id] = rec
+    return preserved
+
+
+def apply_preserved_review_state(fresh: "SceneRecord", preserved_by_id: dict[str, "SceneRecord"]) -> "SceneRecord":
+    """Overlay a freshly-converted record's review-state fields with a preserved
+    one, if the same clip was already reviewed. All other fields (vlm_judgements,
+    frames, clip metadata, ...) come from ``fresh`` — only the human-editable
+    review fields are carried over.
+
+    ``auto_key_evidence`` is included here — the review UI's evidence panel
+    (rationale text, selected_evidence, object_type/target_zone/relations
+    overrides) writes into this same field, so leaving it out would silently
+    discard any evidence edit on the next ``--input`` re-conversion, exactly
+    the class of bug that motivated this preservation mechanism in the first
+    place (see ``load_preserved_review_state``).
+    """
+    old = preserved_by_id.get(fresh.clip.clip_id)
+    if old is None:
+        return fresh
+    return fresh.model_copy(update={
+        "scene_label": old.scene_label,
+        "scene_taxonomy": old.scene_taxonomy,
+        "review_status": old.review_status,
+        "notes": old.notes,
+        "edits": old.edits,
+        "auto_key_evidence": old.auto_key_evidence,
+    })

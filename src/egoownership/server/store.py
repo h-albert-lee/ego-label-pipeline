@@ -4,9 +4,15 @@ Backed by a single JSONL file plus a JSON activity log. We use a simple
 ``filelock`` so multiple workers — and multiple browser tabs — can hit the
 same file without trampling each other.
 
-The file format on disk is one ``SceneRecord`` per line. Reads stream the
-file; writes load → mutate → atomic-rewrite (cheap because the pilot dataset
-is on the order of hundreds of records, not millions).
+The file format on disk is one ``SceneRecord`` per line. Reads and writes
+both go through an in-memory cache of the fully-parsed record list, refreshed
+only when the file's mtime has changed since it was last loaded (so an
+external process rewriting the file — e.g. a batch script, or a second
+`egoown serve` process — is still picked up correctly, not silently
+overwritten by a stale cache). Without this, every single read AND write
+re-parsed the entire file with Pydantic validation, which was fine when the
+pilot dataset was hundreds of records but became the dominant cost (~3-4s per
+request) once it grew to 10k+.
 """
 
 from __future__ import annotations
@@ -49,16 +55,36 @@ class SceneStore:
         if not self.activity_path.exists():
             self.activity_path.write_text("", encoding="utf-8")
         self._lock = threading.Lock()
+        self._cache: list[SceneRecord] | None = None
+        self._cache_mtime: float | None = None
 
     # ---------- reads ----------
 
+    def _load(self) -> list[SceneRecord]:
+        """Parsed records, cached and reused as long as the file's mtime
+        matches what we last loaded. Callers that mutate the result (writes)
+        must pass the returned list back through ``_atomic_rewrite`` and then
+        update ``self._cache``/``self._cache_mtime`` so the cache reflects
+        what's now on disk instead of going stale.
+        """
+        try:
+            mtime = self.path.stat().st_mtime
+        except FileNotFoundError:
+            mtime = None
+        if self._cache is None or mtime != self._cache_mtime:
+            records: list[SceneRecord] = []
+            with self.path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    records.append(SceneRecord.model_validate(json.loads(line)))
+            self._cache = records
+            self._cache_mtime = mtime
+        return self._cache
+
     def iter_records(self) -> Iterator[SceneRecord]:
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                yield SceneRecord.model_validate(json.loads(line))
+        yield from self._load()
 
     def list_summaries(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -108,6 +134,11 @@ class SceneStore:
             except OSError:
                 pass
             raise
+        # Cache what we just wrote, keyed by the new mtime, so the next read
+        # (or the next write's `_load()`) doesn't re-parse what's already in
+        # memory — this is the main save-latency win.
+        self._cache = records
+        self._cache_mtime = self.path.stat().st_mtime
 
     def update(
         self,
@@ -119,7 +150,16 @@ class SceneStore:
         review_status: str | None = None,
         notes: str | None = None,
         object_overrides: dict[str, OwnershipLabel] | None = None,
+        rationale: str | None = None,
+        selected_evidence: list[str] | None = None,
     ) -> SceneRecord | None:
+        """``rationale``/``selected_evidence`` are accepted here too (not just
+        in ``update_evidence``) so the review UI's single save action can
+        persist both scene fields and rationale/evidence in one read-modify-
+        write pass — ``iter_records()`` re-parses the entire (large) file, so
+        doing that twice per save (once per endpoint) roughly doubles save
+        latency for no benefit when both are being saved together anyway.
+        """
         with self._lock:
             records = list(self.iter_records())
             target_idx = next((i for i, r in enumerate(records) if _record_matches_clip_id(r, clip_id)), None)
@@ -197,10 +237,166 @@ class SceneStore:
                 target = target.model_copy(update={"frames": new_frames})
 
             target = target.model_copy(update={"edits": edits})
+
+            if rationale is not None or selected_evidence is not None:
+                target, edits, _ = self._apply_evidence_fields(
+                    target, edits,
+                    annotator=annotator, rationale=rationale, selected_evidence=selected_evidence,
+                )
+
             records[target_idx] = target
             self._atomic_rewrite(records)
             self._append_activity(target, edits[-1] if edits else None)
             return target
+
+    def _apply_evidence_fields(
+        self,
+        target: SceneRecord,
+        edits: list[AnnotationEdit],
+        *,
+        annotator: str,
+        object_type: str | None = None,
+        target_zone: str | None = None,
+        relations: list[dict[str, Any]] | None = None,
+        rationale: str | None = None,
+        selected_evidence: list[str] | None = None,
+    ) -> tuple[SceneRecord, list[AnnotationEdit], bool]:
+        """Apply evidence-panel field changes to ``target``, returning
+        ``(new_target, new_edits, changed)`` — pure in-memory logic, no I/O,
+        so callers (``update``, ``update_evidence``) can fold it into their
+        own single read-modify-write pass instead of each doing their own.
+
+        Object type / zone / relations edits re-derive the automatic label —
+        relations is what the review UI uses to drop a specific held_by edge
+        (e.g. a bystander's box that only coincidentally overlaps the target)
+        without needing to touch zone/object_type to do it. Rationale and
+        selected-evidence edits are free-form human edits and do not trigger
+        label re-derivation by themselves.
+        """
+        ev: dict[str, Any] = dict(target.auto_key_evidence)
+        old_object_type = ev.get("object_type")
+        old_target_zone = ev.get("target_zone")
+        old_relations = list(ev.get("relations") or [])
+        old_rationale = ev.get("rationale")
+        old_selected = list(ev.get("selected_evidence") or [])
+        changed_decision_fields = False
+        changed_freeform_fields = False
+        if object_type is not None and old_object_type != object_type:
+            ev["object_type"] = object_type
+            changed_decision_fields = True
+        if target_zone is not None and old_target_zone != target_zone:
+            ev["target_zone"] = target_zone
+            changed_decision_fields = True
+        if relations is not None and old_relations != relations:
+            ev["relations"] = relations
+            changed_decision_fields = True
+        if rationale is not None and old_rationale != rationale:
+            ev["rationale"] = rationale
+            changed_freeform_fields = True
+        if selected_evidence is not None and old_selected != selected_evidence:
+            ev["selected_evidence"] = selected_evidence
+            changed_freeform_fields = True
+
+        if not changed_decision_fields and not changed_freeform_fields:
+            return target, edits, False
+
+        try:
+            new_label = target.scene_label or OwnershipLabel.AMBIGUOUS
+            new_taxonomy = target.scene_taxonomy or target.clip.taxonomy
+            new_rationale = ev.get("rationale", "")
+
+            if changed_decision_fields:
+                from egoownership.evidence_labeling import _decide_taxonomy_gt
+
+                evidence_for_decision: dict[str, Any] = {
+                    "target_object": ev.get("target_object", ""),
+                    "object_type": ev["object_type"],
+                    "target_zone": ev["target_zone"],
+                    "caption_cues": ev.get("caption_cues") or {},
+                    "relations": ev.get("relations") or [],
+                    "person_count": ev.get("person_count", 0),
+                    "temporal": ev.get("temporal") or {},
+                }
+                row_for_decision: dict[str, Any] = {"verb": ev.get("verb", ""), "nouns": []}
+                result = _decide_taxonomy_gt(row_for_decision, evidence_for_decision)
+
+                new_rationale = rationale if rationale is not None else result.get("rationale", "")
+                new_label_str = result.get("ground_truth", "AMBIGUOUS")
+                new_taxonomy_str = result.get("taxonomy", "D")
+                try:
+                    new_label = OwnershipLabel(new_label_str)
+                except ValueError:
+                    new_label = OwnershipLabel.AMBIGUOUS
+                try:
+                    new_taxonomy = Taxonomy(new_taxonomy_str)
+                except ValueError:
+                    new_taxonomy = Taxonomy.AMBIGUOUS
+            ev["rationale"] = new_rationale
+
+            new_evidence_strings = [new_rationale] if new_rationale else []
+            for k in ("object_type", "target_zone", "verb", "person_count"):
+                v = ev.get(k)
+                if v is not None and v != "":
+                    new_evidence_strings.append(f"{k}: {v}")
+
+            target_object = ev.get("target_object", "target")
+            ev["object_type_evidence"] = (
+                f"The target object '{target_object}' is categorized as {ev['object_type']}."
+            )
+            ev["zone_evidence"] = f"The target object is assigned to {ev['target_zone']}."
+            if relations is not None:
+                from egoownership.evidence_labeling import _summarize_relations
+
+                ev["relation_graph_evidence"] = _summarize_relations(ev.get("relations") or [])
+
+            new_frames = []
+            for fd in target.frames:
+                new_objs = [
+                    o.model_copy(update={"ownership": new_label, "ownership_evidence": new_evidence_strings})
+                    for o in fd.objects
+                ]
+                new_frames.append(fd.model_copy(update={"objects": new_objs}))
+
+            edit_parts = []
+            if changed_decision_fields:
+                edit_parts.append(
+                    f"object_type={old_object_type}->{ev['object_type']}, "
+                    f"target_zone={old_target_zone}->{ev['target_zone']}"
+                )
+            if relations is not None and old_relations != relations:
+                edit_parts.append(f"relations edited ({len(old_relations)} -> {len(relations)} edges)")
+            if rationale is not None and old_rationale != rationale:
+                edit_parts.append("rationale edited")
+            if selected_evidence is not None and old_selected != selected_evidence:
+                edit_parts.append(f"selected_evidence={','.join(selected_evidence)}")
+            edits = [*edits, AnnotationEdit(
+                annotator=annotator,
+                field="auto_key_evidence",
+                old_value=f"object_type={old_object_type}, target_zone={old_target_zone}",
+                new_value="; ".join(edit_parts),
+            )]
+
+            target = target.model_copy(update={
+                "auto_key_evidence": ev,
+                "scene_label": new_label,
+                "scene_taxonomy": new_taxonomy,
+                "frames": new_frames,
+                "edits": edits,
+            })
+        except Exception:
+            # Decision re-derivation failed — just persist the evidence change
+            edits = [*edits, AnnotationEdit(
+                annotator=annotator,
+                field="auto_key_evidence",
+                old_value=f"object_type={old_object_type}, target_zone={old_target_zone}",
+                new_value=(
+                    f"object_type={ev.get('object_type')}, target_zone={ev.get('target_zone')}, "
+                    f"rationale={'edited' if rationale is not None else 'unchanged'}"
+                ),
+            )]
+            target = target.model_copy(update={"auto_key_evidence": ev, "edits": edits})
+
+        return target, edits, True
 
     def update_evidence(
         self,
@@ -213,14 +409,8 @@ class SceneStore:
         rationale: str | None = None,
         selected_evidence: list[str] | None = None,
     ) -> SceneRecord | None:
-        """Update editable evidence fields.
-
-        Object type / zone / relations edits re-derive the automatic label —
-        relations is what the review UI uses to drop a specific held_by edge
-        (e.g. a bystander's box that only coincidentally overlaps the target)
-        without needing to touch zone/object_type to do it. Rationale and
-        selected-evidence edits are free-form human edits and do not trigger
-        label re-derivation by themselves.
+        """Update editable evidence fields (used by the per-field auto-save
+        dropdowns in the review UI, independent of the main save action).
         """
         with self._lock:
             records = list(self.iter_records())
@@ -228,131 +418,15 @@ class SceneStore:
             if target_idx is None:
                 return None
             target = records[target_idx]
-
-            ev: dict[str, Any] = dict(target.auto_key_evidence)
-            old_object_type = ev.get("object_type")
-            old_target_zone = ev.get("target_zone")
-            old_relations = list(ev.get("relations") or [])
-            old_rationale = ev.get("rationale")
-            old_selected = list(ev.get("selected_evidence") or [])
-            changed_decision_fields = False
-            changed_freeform_fields = False
-            if object_type is not None and old_object_type != object_type:
-                ev["object_type"] = object_type
-                changed_decision_fields = True
-            if target_zone is not None and old_target_zone != target_zone:
-                ev["target_zone"] = target_zone
-                changed_decision_fields = True
-            if relations is not None and old_relations != relations:
-                ev["relations"] = relations
-                changed_decision_fields = True
-            if rationale is not None and old_rationale != rationale:
-                ev["rationale"] = rationale
-                changed_freeform_fields = True
-            if selected_evidence is not None and old_selected != selected_evidence:
-                ev["selected_evidence"] = selected_evidence
-                changed_freeform_fields = True
-
-            if not changed_decision_fields and not changed_freeform_fields:
-                return target
-
             edits: list[AnnotationEdit] = list(target.edits)
 
-            try:
-                new_label = target.scene_label or OwnershipLabel.AMBIGUOUS
-                new_taxonomy = target.scene_taxonomy or target.clip.taxonomy
-                new_rationale = ev.get("rationale", "")
-
-                if changed_decision_fields:
-                    from egoownership.catv_evidence_label import _decide_taxonomy_gt
-
-                    evidence_for_decision: dict[str, Any] = {
-                        "target_object": ev.get("target_object", ""),
-                        "object_type": ev["object_type"],
-                        "target_zone": ev["target_zone"],
-                        "caption_cues": ev.get("caption_cues") or {},
-                        "relations": ev.get("relations") or [],
-                        "person_count": ev.get("person_count", 0),
-                        "temporal": ev.get("temporal") or {},
-                    }
-                    row_for_decision: dict[str, Any] = {"verb": ev.get("verb", ""), "nouns": []}
-                    result = _decide_taxonomy_gt(row_for_decision, evidence_for_decision)
-
-                    new_rationale = rationale if rationale is not None else result.get("rationale", "")
-                    new_label_str = result.get("ground_truth", "AMBIGUOUS")
-                    new_taxonomy_str = result.get("taxonomy", "D")
-                    try:
-                        new_label = OwnershipLabel(new_label_str)
-                    except ValueError:
-                        new_label = OwnershipLabel.AMBIGUOUS
-                    try:
-                        new_taxonomy = Taxonomy(new_taxonomy_str)
-                    except ValueError:
-                        new_taxonomy = Taxonomy.AMBIGUOUS
-                ev["rationale"] = new_rationale
-
-                new_evidence_strings = [new_rationale] if new_rationale else []
-                for k in ("object_type", "target_zone", "verb", "person_count"):
-                    v = ev.get(k)
-                    if v is not None and v != "":
-                        new_evidence_strings.append(f"{k}: {v}")
-
-                target_object = ev.get("target_object", "target")
-                ev["object_type_evidence"] = (
-                    f"The target object '{target_object}' is categorized as {ev['object_type']}."
-                )
-                ev["zone_evidence"] = f"The target object is assigned to {ev['target_zone']}."
-                if relations is not None:
-                    from egoownership.catv_evidence_label import _summarize_relations
-
-                    ev["relation_graph_evidence"] = _summarize_relations(ev.get("relations") or [])
-
-                new_frames = []
-                for fd in target.frames:
-                    new_objs = [
-                        o.model_copy(update={"ownership": new_label, "ownership_evidence": new_evidence_strings})
-                        for o in fd.objects
-                    ]
-                    new_frames.append(fd.model_copy(update={"objects": new_objs}))
-
-                edit_parts = []
-                if changed_decision_fields:
-                    edit_parts.append(
-                        f"object_type={old_object_type}->{ev['object_type']}, "
-                        f"target_zone={old_target_zone}->{ev['target_zone']}"
-                    )
-                if relations is not None and old_relations != relations:
-                    edit_parts.append(f"relations edited ({len(old_relations)} -> {len(relations)} edges)")
-                if rationale is not None and old_rationale != rationale:
-                    edit_parts.append("rationale edited")
-                if selected_evidence is not None and old_selected != selected_evidence:
-                    edit_parts.append(f"selected_evidence={','.join(selected_evidence)}")
-                edits.append(AnnotationEdit(
-                    annotator=annotator,
-                    field="auto_key_evidence",
-                    old_value=f"object_type={old_object_type}, target_zone={old_target_zone}",
-                    new_value="; ".join(edit_parts),
-                ))
-
-                target = target.model_copy(update={
-                    "auto_key_evidence": ev,
-                    "scene_label": new_label,
-                    "scene_taxonomy": new_taxonomy,
-                    "frames": new_frames,
-                    "edits": edits,
-                })
-            except Exception:
-                # Decision re-derivation failed — just persist the evidence change
-                edits.append(AnnotationEdit(
-                    annotator=annotator,
-                    field="auto_key_evidence",
-                    old_value=f"object_type={old_object_type}, target_zone={old_target_zone}",
-                    new_value=(
-                        f"object_type={ev.get('object_type')}, target_zone={ev.get('target_zone')}, "
-                        f"rationale={'edited' if rationale is not None else 'unchanged'}"
-                    ),
-                ))
-                target = target.model_copy(update={"auto_key_evidence": ev, "edits": edits})
+            target, edits, changed = self._apply_evidence_fields(
+                target, edits,
+                annotator=annotator, object_type=object_type, target_zone=target_zone,
+                relations=relations, rationale=rationale, selected_evidence=selected_evidence,
+            )
+            if not changed:
+                return target
 
             records[target_idx] = target
             self._atomic_rewrite(records)

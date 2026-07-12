@@ -43,6 +43,11 @@ class SceneUpdateBody(BaseModel):
     review_status: str | None = None
     notes: str | None = None
     object_overrides: dict[str, OwnershipLabel] | None = None
+    # Optional: lets the review UI's single save action persist rationale/
+    # selected_evidence together with the scene fields in one pass, instead
+    # of a separate call to /evidence (see SceneStore.update).
+    rationale: str | None = None
+    selected_evidence: list[str] | None = None
 
 
 class EvidenceUpdateBody(BaseModel):
@@ -55,7 +60,7 @@ class EvidenceUpdateBody(BaseModel):
 
 
 def _resolve_video(videos_root: Path | None, video_id: str) -> Path | None:
-    # video_id may be a leading-slash-stripped absolute path (from one-pass-labels pipeline).
+    # video_id may be a leading-slash-stripped absolute path (from auto-label pipeline).
     # Reconstruct as absolute by prepending "/" and check if it exists.
     abs_candidate = Path("/" + video_id)
     if abs_candidate.exists():
@@ -102,7 +107,7 @@ def create_app(
     def runtime_config() -> dict[str, Any]:
         """Tell the frontend what the server has, so it can show/hide features."""
         return {
-            "videos_available": True,
+            "videos_available": videos_root is not None,
             "frames_root": str(frames_root),
         }
 
@@ -174,6 +179,8 @@ def create_app(
             review_status=body.review_status,
             notes=body.notes,
             object_overrides=body.object_overrides,
+            rationale=body.rationale,
+            selected_evidence=body.selected_evidence,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail=f"clip {clip_id!r} not found")

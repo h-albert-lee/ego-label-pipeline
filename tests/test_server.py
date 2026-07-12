@@ -123,6 +123,44 @@ def test_post_update_records_edit_and_activity(client: TestClient):
     assert any(a["clip_id"] == "demo:give_pen" and a["annotator"] == "alice" for a in activity)
 
 
+def test_post_update_also_persists_rationale_in_one_request(client: TestClient):
+    # The main save endpoint accepts rationale/selected_evidence too, so the
+    # review UI can save scene fields + evidence-panel edits together in a
+    # single request instead of two separate ones (store.update folds both
+    # into one read-modify-write pass -- see SceneStore._apply_evidence_fields).
+    res = client.post(
+        "/api/scenes/demo:give_pen",
+        json={
+            "annotator": "alice",
+            "review_status": "verified",
+            "rationale": "combined save test text",
+            "selected_evidence": ["zone"],
+        },
+    )
+    assert res.status_code == 200
+    rec = res.json()
+    assert rec["review_status"] == "verified"
+    assert rec["auto_key_evidence"]["rationale"] == "combined save test text"
+    assert rec["auto_key_evidence"]["selected_evidence"] == ["zone"]
+    # Re-fetch to confirm it was actually persisted, not just echoed back.
+    refetched = client.get("/api/scenes/demo:give_pen").json()
+    assert refetched["auto_key_evidence"]["rationale"] == "combined save test text"
+    assert refetched["auto_key_evidence"]["selected_evidence"] == ["zone"]
+
+
+def test_post_evidence_endpoint_still_works_standalone(client: TestClient):
+    # Regression check: /evidence must keep working independently of the
+    # main /api/scenes/{id} endpoint after the shared-logic refactor.
+    res = client.post(
+        "/api/scenes/demo:give_pen/evidence",
+        json={"annotator": "bob", "rationale": "standalone evidence save"},
+    )
+    assert res.status_code == 200
+    rec = res.json()
+    assert rec["auto_key_evidence"]["rationale"] == "standalone evidence save"
+    assert any(e["field"] == "auto_key_evidence" and e["annotator"] == "bob" for e in rec["edits"])
+
+
 def test_object_override_applies_label(client: TestClient):
     res = client.post(
         "/api/scenes/demo:give_pen",

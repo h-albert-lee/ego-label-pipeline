@@ -1,7 +1,7 @@
-"""Dataset adapters for the CAT-V bbox → caption → label pipeline.
+"""Dataset adapters for the ownership-labeling pipeline.
 
 Each adapter normalizes caption records, resolves local video paths, and
-chooses cache-directory layout for frames / CAT-V work files.
+chooses cache-directory layout for frames / labeling work files.
 """
 
 from __future__ import annotations
@@ -11,28 +11,42 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from egoownership.catv_io import iter_jsonl, normalize_object_noun, safe_path_part
-from egoownership.catv_nouns import (
-    _ego4d_narration_example_id,
-    _iter_ego4d_table_narrations,
+import json
+
+from egoownership.config import normalize_object_noun, safe_path_part
+from egoownership.tabletop_nouns import (
+    caption_mentions_table,
     extract_caption_object_nouns,
-    ego4d_person_tokens,
 )
-from egoownership.egolife_annotations import (
-    _caption_mentions_table,
-    _extract_caption_verb_nouns,
+from egoownership.datasets.egolife_source import (
     _iter_egolife_cap_srt_records,
     _translate_caption_text,
 )
-from egoownership.ego4d_video import (
+from egoownership.datasets.ego4d_source import (
     DEFAULT_CLIP_WINDOW_SEC,
     centered_clip_window,
     default_scratch_root,
     download_ego4d_video,
+    ego4d_narration_example_id,
+    ego4d_person_tokens,
     ego4d_subclip_cache_path,
     ensure_ego4d_subclip,
+    iter_ego4d_table_narrations,
     locate_ego4d_full_video,
 )
+
+
+def iter_jsonl(path: Path, *, skip_bad: bool = False) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                if not skip_bad:
+                    raise
 
 
 def normalize_dataset_id(name: str) -> str:
@@ -48,7 +62,7 @@ def normalize_dataset_id(name: str) -> str:
     return aliases.get(value, value)
 
 
-class CatVDatasetAdapter(Protocol):
+class LabelingDatasetAdapter(Protocol):
     dataset_id: str
 
     def iter_caption_records(
@@ -75,7 +89,7 @@ def _iter_filtered_qwen_caption_records(
     for record in iter_jsonl(path):
         caption = str(record.get("dense_caption") or "")
         translated = str(record.get("dense_caption_en") or record.get("qwen_translation") or "")
-        if not _caption_mentions_table(caption) and not _caption_mentions_table(translated):
+        if not caption_mentions_table(caption) and not caption_mentions_table(translated):
             continue
 
         raw_nouns = [
@@ -112,7 +126,7 @@ def _iter_filtered_qwen_caption_records(
 
 
 @dataclass(frozen=True)
-class EgoLifeCatVAdapter:
+class EgoLifeDatasetAdapter:
     dataset_id: str = "egolife"
 
     def iter_caption_records(
@@ -128,11 +142,10 @@ class EgoLifeCatVAdapter:
         for record in _iter_egolife_cap_srt_records(path):
             caption = record.get("dense_caption") or ""
             translated = _translate_caption_text(caption)
-            verb, nouns = _extract_caption_verb_nouns(translated or caption)
-            nouns = [noun for noun in nouns if noun not in {"object", "table", "chair"}]
+            verb, nouns, noun_source = extract_caption_object_nouns(translated or caption)
             if object_nouns is not None:
                 nouns = [noun for noun in nouns if normalize_object_noun(noun) in object_nouns]
-            if not _caption_mentions_table(caption) and not _caption_mentions_table(translated):
+            if not caption_mentions_table(caption) and not caption_mentions_table(translated):
                 continue
             if not nouns:
                 continue
@@ -143,6 +156,12 @@ class EgoLifeCatVAdapter:
                 "dense_caption_en": translated,
                 "verb": verb,
                 "nouns": nouns,
+                "noun_candidates": noun_source.get("spacy_noun_candidates") or [],
+                "source": {
+                    **(record.get("source") or {}),
+                    **noun_source,
+                    "input_kind": "egolife_cap_srt",
+                },
             }
 
     def resolve_video_segment(
@@ -225,7 +244,7 @@ class GenericJsonlAdapter:
 
 
 @dataclass
-class Ego4DCatVAdapter:
+class Ego4DDatasetAdapter:
     dataset_id: str = "ego4d_fho"
     clip_window_sec: float = DEFAULT_CLIP_WINDOW_SEC
     auto_download: bool = True
@@ -249,7 +268,7 @@ class Ego4DCatVAdapter:
             return
 
         raise ValueError(
-            f"Ego4D CAT-V input must be narration.json or a candidates JSONL file, got: {path}"
+            f"Ego4D labeling input must be narration.json or a candidates JSONL file, got: {path}"
         )
 
     def _iter_jsonl_caption_records(
@@ -262,7 +281,7 @@ class Ego4DCatVAdapter:
             narration = str(record.get("narration") or record.get("dense_caption") or "").strip()
             if not narration:
                 continue
-            if not _caption_mentions_table(narration):
+            if not caption_mentions_table(narration):
                 continue
 
             try:
@@ -295,7 +314,7 @@ class Ego4DCatVAdapter:
         *,
         object_nouns: set[str] | None,
     ) -> Iterable[dict[str, Any]]:
-        for video_uid, entry, narration in _iter_ego4d_table_narrations(
+        for video_uid, entry, narration in iter_ego4d_table_narrations(
             path,
             require_observer=self.require_observer,
         ):
@@ -308,7 +327,7 @@ class Ego4DCatVAdapter:
             except (TypeError, ValueError):
                 continue
 
-            clip_id = _ego4d_narration_example_id(video_uid, entry)
+            clip_id = ego4d_narration_example_id(video_uid, entry)
             built = _build_ego4d_caption_record(
                 video_id=video_uid,
                 clip_id=clip_id,
@@ -529,23 +548,23 @@ def resolve_egolife_video_path(videos_root: Path, record: dict[str, Any]) -> Pat
     return resolved[0] if resolved else None
 
 
-_DATASET_ADAPTERS: dict[str, CatVDatasetAdapter] = {
-    "egolife": EgoLifeCatVAdapter(),
+_DATASET_ADAPTERS: dict[str, LabelingDatasetAdapter] = {
+    "egolife": EgoLifeDatasetAdapter(),
     "generic": GenericJsonlAdapter(),
 }
 
-# User-registered adapters (via register_catv_dataset_adapter) take precedence
+# User-registered adapters (via register_dataset_adapter) take precedence
 # over the built-in ones so that callers can override or extend the registry
 # without modifying this module.
-_REGISTERED_ADAPTERS: dict[str, CatVDatasetAdapter] = {}
+_REGISTERED_ADAPTERS: dict[str, LabelingDatasetAdapter] = {}
 
 
-def register_catv_dataset_adapter(name: str, adapter: CatVDatasetAdapter) -> None:
+def register_dataset_adapter(name: str, adapter: LabelingDatasetAdapter) -> None:
     """Register a custom dataset adapter accessible via --dataset <name>.
 
     Example::
 
-        from egoownership.catv_datasets import register_catv_dataset_adapter
+        from egoownership.datasets.adapters import register_dataset_adapter
 
         class MyDatasetAdapter:
             dataset_id = "mydataset"
@@ -553,21 +572,21 @@ def register_catv_dataset_adapter(name: str, adapter: CatVDatasetAdapter) -> Non
             def resolve_video_segment(self, videos_root, record): ...
             def storage_parts(self, record): ...
 
-        register_catv_dataset_adapter("mydataset", MyDatasetAdapter())
+        register_dataset_adapter("mydataset", MyDatasetAdapter())
     """
     _REGISTERED_ADAPTERS[normalize_dataset_id(name)] = adapter
 
 
-def get_catv_dataset_adapter(
+def get_dataset_adapter(
     dataset: str,
     *,
     ego4d_clip_window_sec: float = DEFAULT_CLIP_WINDOW_SEC,
     ego4d_auto_download: bool = True,
     ego4d_require_observer: bool = True,
-) -> CatVDatasetAdapter:
+) -> LabelingDatasetAdapter:
     key = normalize_dataset_id(dataset)
     if key == "ego4d_fho":
-        return Ego4DCatVAdapter(
+        return Ego4DDatasetAdapter(
             clip_window_sec=ego4d_clip_window_sec,
             auto_download=ego4d_auto_download,
             require_observer=ego4d_require_observer,
@@ -576,5 +595,5 @@ def get_catv_dataset_adapter(
     adapter = _REGISTERED_ADAPTERS.get(key) or _DATASET_ADAPTERS.get(key)
     if adapter is None:
         supported = ", ".join(sorted({*_DATASET_ADAPTERS, *_REGISTERED_ADAPTERS, "ego4d_fho"}))
-        raise ValueError(f"Unsupported CAT-V dataset {dataset!r}. Supported: {supported}")
+        raise ValueError(f"Unsupported labeling dataset {dataset!r}. Supported: {supported}")
     return adapter

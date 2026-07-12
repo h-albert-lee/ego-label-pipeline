@@ -79,9 +79,7 @@ def person_relative_zones(
 def depth_aware_refine(
     zones: FrameZones, *, wearer_depth_band: tuple[float, float] | None
 ) -> FrameZones:
-    """Just stamp the derivation tag — actual depth lookup happens per-object
-    in :func:`egoownership.detection.ownership._classify_with_zones`.
-    """
+    """Stamp the derivation tag for callers that provide depth-aware zones."""
     if wearer_depth_band is None:
         return zones
     return zones.model_copy(update={"derivation": zones.derivation + "+depth"})

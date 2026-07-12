@@ -1,7 +1,7 @@
 """labels_row_to_scene_record's optional vlm-crosscheck merge (side-by-side,
 never replacing the auto pipeline's own scene_label/auto_key_evidence)."""
 
-from egoownership.catv_pipeline import labels_row_to_scene_record
+from egoownership.labeling_pipeline import labels_row_to_scene_record
 from egoownership.schema import OwnershipLabel
 
 

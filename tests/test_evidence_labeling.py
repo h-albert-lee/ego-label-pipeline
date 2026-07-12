@@ -1,7 +1,11 @@
-from egoownership.catv_evidence_label import (
+from egoownership.evidence_labeling import (
+    _caption_cues,
+    _caption_interaction_evidence,
     _decide_taxonomy_gt,
     _gt_from_past_frame_clue,
     _held_by_wearer_relation,
+    _is_ego4d_row,
+    _narration_actor_prefix,
     _summarize_context_change,
 )
 from egoownership.schema import BBox
@@ -292,3 +296,135 @@ def test_summarize_context_change_reports_only_analyzed_frames():
     assert "t-2" in summary and "other_person_zone" in summary
     assert "the zone changes from other_person_zone to ego_zone" in summary
     assert "unknown_zone" not in summary
+
+
+# ---------------------------------------------------------------------------
+# Ego4D: narration only (no object_caption), #C/#O actor prefix parsing
+# ---------------------------------------------------------------------------
+
+def test_narration_actor_prefix_parses_c_and_o_tags():
+    assert _narration_actor_prefix("#C picks up the bag") == "ego"
+    assert _narration_actor_prefix("#O man E moves bag on the table") == "other"
+    assert _narration_actor_prefix("#O2 places the cup down") == "other"
+    assert _narration_actor_prefix("#OO takes block from the table") == "other"
+    assert _narration_actor_prefix("no hash prefix here") is None
+    assert _narration_actor_prefix("") is None
+    assert _narration_actor_prefix(None) is None
+
+
+def test_is_ego4d_row_checks_dataset_and_source_dataset():
+    assert _is_ego4d_row({"dataset": "ego4d"})
+    assert _is_ego4d_row({"source_dataset": "ego4d_fho"})
+    assert not _is_ego4d_row({"dataset": "egolife"})
+    assert not _is_ego4d_row({})
+
+
+def test_caption_cues_object_caption_fills_gaps_for_non_actor_cues_on_ego4d():
+    # object_caption is a fallback for the non-actor cues (transfer, serving,
+    # etc.) when narration alone doesn't mention the relevant keyword -- it's
+    # only excluded from actor-cue (ego_actor/other_actor) detection, since
+    # that's the one signal it's known to hallucinate on for this dataset.
+    row = {
+        "dataset": "ego4d",
+        "object_caption": "The other person handed the bag over.",
+        "dense_caption_en": "#O man E moves bag on the table",
+    }
+    cues = _caption_cues(row)
+    assert cues["transfer"] is True
+
+
+def test_caption_cues_disagreement_trusts_neither_for_ego4d():
+    # object_caption claims "camera wearer" but narration's #O tag says
+    # otherwise -- neither is trusted; both actor cues stay False so the
+    # decision falls through to the zone tier instead of picking a side.
+    row = {
+        "dataset": "ego4d",
+        "object_caption": "The camera wearer picks up the bag.",
+        "dense_caption_en": "#O man E moves bag on the table",
+    }
+    cues = _caption_cues(row)
+    assert cues["ego_actor"] is False
+    assert cues["other_actor"] is False
+
+
+def test_caption_cues_agreement_sets_actor_for_ego4d():
+    # Both narration (#O) and object_caption's own keyword ("other person")
+    # agree -- that's high-confidence, use it.
+    row = {
+        "dataset": "ego4d",
+        "object_caption": "The other person picks up the bag.",
+        "dense_caption_en": "#O man E moves bag on the table",
+    }
+    cues = _caption_cues(row)
+    assert cues["other_actor"] is True
+    assert cues["ego_actor"] is False
+
+
+def test_caption_cues_object_caption_only_signal_used_for_ego4d():
+    # Narration has no parseable #C/#O tag but object_caption does have an
+    # actor claim -- nothing to disagree with, so use it.
+    row = {
+        "dataset": "ego4d",
+        "object_caption": "The camera wearer picks up the bag.",
+        "dense_caption_en": "no hash prefix here",
+    }
+    cues = _caption_cues(row)
+    assert cues["ego_actor"] is True
+    assert cues["other_actor"] is False
+
+
+def test_caption_cues_uses_object_caption_for_non_ego4d():
+    row = {
+        "dataset": "egolife",
+        "object_caption": "The other person handed the bag over.",
+        "dense_caption_en": "unrelated text",
+    }
+    cues = _caption_cues(row)
+    assert cues["transfer"] is True
+
+
+def test_caption_cues_narration_prefix_sets_other_actor_for_ego4d():
+    # Raw Ego4D narration never contains English phrases like "other person"
+    # -- only the #O prefix reliably signals the actor here.
+    row = {"dataset": "ego4d", "dense_caption_en": "#O man E moves bag on the table"}
+    cues = _caption_cues(row)
+    assert cues["other_actor"] is True
+    assert cues["ego_actor"] is False
+
+
+def test_caption_cues_narration_prefix_sets_ego_actor_for_ego4d():
+    row = {"dataset": "ego4d", "dense_caption_en": "#C picks up the bag from the table"}
+    cues = _caption_cues(row)
+    assert cues["ego_actor"] is True
+    assert cues["other_actor"] is False
+
+
+def test_caption_interaction_evidence_prefers_object_caption_for_ego4d():
+    row = {
+        "dataset": "ego4d",
+        "object_caption": "(3) camera wearer picks up the plate quickly.",
+        "dense_caption_en": "#O man E moves bag on the table",
+    }
+    evidence = _caption_interaction_evidence(row)
+    assert "plate" in evidence
+    assert "bag" not in evidence
+
+
+def test_caption_interaction_evidence_falls_back_to_narration_for_ego4d():
+    row = {
+        "dataset": "ego4d",
+        "object_caption": "",
+        "dense_caption_en": "#O man E moves bag on the table",
+    }
+    evidence = _caption_interaction_evidence(row)
+    assert "bag" in evidence
+
+
+def test_caption_interaction_evidence_uses_object_caption_for_non_ego4d():
+    row = {
+        "dataset": "egolife",
+        "object_caption": "(1) intro\n(3) camera wearer picks up the plate quickly.\n(4) more",
+        "dense_caption_en": "unrelated fallback text",
+    }
+    evidence = _caption_interaction_evidence(row)
+    assert "plate" in evidence

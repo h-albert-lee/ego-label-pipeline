@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -461,6 +462,25 @@ def _resolve_frame_paths(
     return paths
 
 
+def _ffmpeg_extract_frame(
+    video_path: Path, dest: Path, timestamp_sec: float, *, force: bool = False
+) -> Path | None:
+    if dest.exists() and not force:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(0.0, timestamp_sec):.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1", "-q:v", "2", "-y", str(dest),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception:
+        return None
+    return dest if dest.exists() else None
+
+
 def _reconstruct_frame_paths(
     record: dict[str, Any], videos_root: Path, cache_dir: Path | None
 ) -> list[Path | None]:
@@ -476,8 +496,6 @@ def _reconstruct_frame_paths(
     absolute timestamp for each tag is simply
     ``source_video_start_sec + frame_times_sec[tag]``.
     """
-    from egoownership.catv_pipeline import _ffmpeg_extract_frame
-
     video_id = record.get("video_id")
     start = record.get("source_video_start_sec")
     frame_times = record.get("frame_times_sec") or {}
@@ -519,6 +537,26 @@ def _load_existing_ids(path: Path) -> set[str]:
     return ids
 
 
+def _load_disagreed_rows(path: Path) -> dict[str, dict[str, Any]]:
+    """Full prior-crosscheck rows (keyed by id) where the prior judge(s)
+    already disagreed with the auto label (``majority_agrees`` is False).
+
+    Used to skip spending a new judge call on these — a disagreement already
+    flags the record for human review, so a second judge's opinion doesn't
+    change the triage outcome. The full row (not just the id) is kept so it
+    can be passed through unchanged into the new output file, keeping the
+    output's row count equal to the input's rather than silently dropping
+    these records.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return rows
+    for row in _iter_jsonl(path):
+        if row.get("majority_agrees") is False and row.get("id"):
+            rows[row["id"]] = row
+    return rows
+
+
 def write_crosscheck_jsonl(
     labels_path: Path,
     out_path: Path,
@@ -526,6 +564,7 @@ def write_crosscheck_jsonl(
     *,
     frames_root: Path | None = None,
     videos_root: Path | None = None,
+    only_agreed_in: Path | None = None,
     limit: int | None = None,
     resume: bool = True,
     show_progress: bool = True,
@@ -539,6 +578,16 @@ def write_crosscheck_jsonl(
     own annotations but not frame crops derived from a licensed source video
     like Ego4D). See ``_reconstruct_frame_paths``.
 
+    ``only_agreed_in``, when given, points at an existing crosscheck JSONL
+    (e.g. from a prior judge). Records already known to disagree there
+    (``majority_agrees: false``) are passed through into the output
+    unchanged instead of being re-judged here — a disagreement already
+    flags the record for human review, so a second judge's opinion doesn't
+    change the triage outcome, only costs more API calls. The output still
+    gets one row per input record (same total count as an unfiltered run);
+    disagreed rows just carry the prior judge's data forward rather than
+    being silently dropped.
+
     Output schema per row:
       id, auto_ground_truth,
       judges: {model_id: {label, object_type_evidence, zone_evidence,
@@ -547,6 +596,7 @@ def write_crosscheck_jsonl(
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing_ids = _load_existing_ids(out_path) if resume else set()
+    disagreed_rows = _load_disagreed_rows(only_agreed_in) if only_agreed_in else {}
 
     records = list(_iter_jsonl(labels_path))
     if limit:
@@ -566,6 +616,16 @@ def write_crosscheck_jsonl(
     with out_path.open(mode, encoding="utf-8") as fh:
         for record in todo:
             rid = record.get("id", "")
+
+            if rid in disagreed_rows:
+                # Already known to disagree with a prior judge — carry that
+                # row forward unchanged rather than spending a new judge
+                # call on it, while still keeping the output complete.
+                fh.write(json.dumps(disagreed_rows[rid], ensure_ascii=False) + "\n")
+                fh.flush()
+                n_written += 1
+                continue
+
             auto_gt = record.get("auto_ground_truth") or record.get("auto_label") or ""
             ref_bbox = (record.get("object") or {}).get("bbox") or {}
             temporal_objects = record.get("temporal_target_objects") or {}
@@ -621,4 +681,53 @@ def write_crosscheck_jsonl(
             fh.flush()
             n_written += 1
 
+    return n_written
+
+
+def merge_crosscheck_jsonl(paths: list[Path], out_path: Path) -> int:
+    """Merge two or more crosscheck JSONL files (e.g. separate per-judge runs
+    from ``--only-agreed-in``) into one file with every judge's result per id.
+
+    Rows are combined by ``id``; each input's ``judges`` dict is unioned
+    together (a later path's judge overwrites an earlier one only if they
+    share the same model_id key), and agreement_count/ratio/majority_label/
+    majority_agrees are recomputed over the combined judge set. A row missing
+    from some inputs but present in others is still included, using
+    whichever ones have it.
+    """
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for path in paths:
+        for row in _iter_jsonl(path):
+            rid = row.get("id")
+            if not rid:
+                continue
+            if rid not in rows_by_id:
+                order.append(rid)
+                rows_by_id[rid] = {"id": rid, "auto_ground_truth": row.get("auto_ground_truth", ""), "judges": {}}
+            rows_by_id[rid]["judges"].update(row.get("judges") or {})
+            if not rows_by_id[rid]["auto_ground_truth"]:
+                rows_by_id[rid]["auto_ground_truth"] = row.get("auto_ground_truth", "")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_written = 0
+    with out_path.open("w", encoding="utf-8") as fh:
+        for rid in order:
+            merged = rows_by_id[rid]
+            judges = merged["judges"]
+            auto_gt = merged["auto_ground_truth"]
+            labels_predicted = [v["label"] for v in judges.values() if v.get("label") in VALID_LABELS]
+            agreement_count = sum(1 for v in judges.values() if v.get("agrees"))
+            majority_label = Counter(labels_predicted).most_common(1)[0][0] if labels_predicted else "UNKNOWN"
+            row = {
+                "id": rid,
+                "auto_ground_truth": auto_gt,
+                "judges": judges,
+                "agreement_count": agreement_count,
+                "agreement_ratio": round(agreement_count / max(1, len(judges)), 4),
+                "majority_label": majority_label,
+                "majority_agrees": majority_label == auto_gt,
+            }
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            n_written += 1
     return n_written

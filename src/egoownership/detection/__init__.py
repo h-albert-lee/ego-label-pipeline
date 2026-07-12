@@ -1,5 +1,5 @@
-"""Detection / segmentation wrappers."""
+"""Detection / segmentation wrappers used by the labeling pipeline."""
 
-from egoownership.detection.ownership import assign_ownership
+from egoownership.detection.object_segmentation import Sam2ObjectConfig, Sam2ObjectExtractor
 
-__all__ = ["assign_ownership"]
+__all__ = ["Sam2ObjectConfig", "Sam2ObjectExtractor"]

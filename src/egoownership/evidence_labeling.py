@@ -1,7 +1,7 @@
-"""Merge EgoLife CAT-V object captions with lightweight visual evidence.
+"""Merge object captions with lightweight visual evidence.
 
 This module is intentionally narrower than the original ``detect`` pipeline:
-the target object box already comes from SAM-3/SAM-2/CAT-V, so we only add the
+the target object box already comes from SAM-3/SAM-2, so we only add the
 useful missing pieces for ownership labels: visible persons, simple zones,
 relations, and a conservative taxonomy/GT proposal.
 """
@@ -697,19 +697,56 @@ def _sentence(value: Any) -> str:
     return text
 
 
-def _caption_interaction_evidence(row: dict[str, Any]) -> str:
+def _is_ego4d_row(row: dict[str, Any]) -> bool:
+    return str(row.get("dataset") or row.get("source_dataset") or "").lower() in {"ego4d", "ego4d_fho"}
+
+
+def _narration_actor_prefix(text: Any) -> str | None:
+    """Ego4D narration convention: a leading ``#C`` tag means the camera
+    wearer is the narrated actor; a leading ``#O`` (also seen as ``#O2``,
+    ``#OO``, ... for multiple observed people) means another visible person
+    is. This is a direct, reliable signal — stronger than scanning the text
+    for English phrases like "camera wearer", which raw Ego4D narrations
+    (e.g. "#O man E moves bag on the table") never actually contain.
+    """
+    match = re.match(r"^\s*#([A-Za-z]+)", str(text or ""))
+    if not match:
+        return None
+    tag = match.group(1).upper()
+    if tag == "C":
+        return "ego"
+    if tag.startswith("O"):
+        return "other"
+    return None
+
+
+def _object_caption_interaction_sentence(row: dict[str, Any]) -> str:
+    """First sentence of object_caption's "(3) who interacts with HO" section,
+    or "" if absent/unparseable."""
     object_caption = str(row.get("object_caption") or "")
     match = re.search(r"\(3\)\s*(.*?)(?=\n\s*\(\d+\)|$)", object_caption, flags=re.DOTALL)
-    if match:
-        first_line = next((line.strip() for line in match.group(1).splitlines() if line.strip()), "")
-        if first_line:
-            first_sentence = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0]
-            return _sentence(first_sentence)
+    if not match:
+        return ""
+    first_line = next((line.strip() for line in match.group(1).splitlines() if line.strip()), "")
+    if not first_line:
+        return ""
+    first_sentence = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0]
+    return _sentence(first_sentence)
+
+
+def _caption_interaction_evidence(row: dict[str, Any]) -> str:
+    # object_caption (catv caption) is primary: it's sometimes correct even
+    # on ego4d, where the narration is used as a fallback only when
+    # object_caption gives nothing parseable.
+    text = _object_caption_interaction_sentence(row)
+    if text:
+        return text
 
     for key in ("dense_caption_en", "transcript"):
         text = _sentence(row.get(key))
         if text:
             return text
+
     return "No caption interaction evidence was recorded for this target."
 
 
@@ -825,11 +862,50 @@ def _build_key_evidence(
     }
 
 
+def _object_caption_actor(object_caption_text: str) -> str | None:
+    """Actor claim from object_caption's own keyword match, or None if it
+    makes no claim (or claims both, which is itself not a clean signal)."""
+    has_ego = any(p in object_caption_text for p in _EGO_PATTERNS)
+    has_other = any(p in object_caption_text for p in _OTHER_PATTERNS)
+    if has_ego and not has_other:
+        return "ego"
+    if has_other and not has_ego:
+        return "other"
+    return None
+
+
 def _caption_cues(row: dict[str, Any]) -> dict[str, bool]:
-    text = " ".join(
-        str(row.get(key) or "")
-        for key in ("object_caption", "dense_caption_en", "transcript_en", "qwen_translation")
-    ).lower()
+    is_ego4d = _is_ego4d_row(row)
+    narration_text = " ".join(str(row.get(key) or "") for key in ("dense_caption_en", "transcript")).lower()
+    object_caption_text = str(row.get("object_caption") or "").lower()
+    ego_actor = other_actor = False
+    if is_ego4d:
+        # Cross-check narration's #C/#O tag against object_caption's own
+        # keyword-based actor claim, computed independently. When they
+        # agree, that's a high-confidence signal (two independently
+        # generated sources converging). When they disagree, neither is
+        # trusted here -- gt falls through to the zone tier instead (see
+        # _decide_taxonomy_gt). When only one has a signal, use it.
+        text = " ".join([object_caption_text, narration_text])
+        narration_actor = _narration_actor_prefix(row.get("dense_caption_en"))
+        object_actor = _object_caption_actor(object_caption_text)
+        if narration_actor and object_actor:
+            if narration_actor == object_actor:
+                ego_actor = narration_actor == "ego"
+                other_actor = narration_actor == "other"
+            # else: disagreement -- leave both False, deferring to zone.
+        elif narration_actor:
+            ego_actor = narration_actor == "ego"
+            other_actor = narration_actor == "other"
+        elif object_actor:
+            ego_actor = object_actor == "ego"
+            other_actor = object_actor == "other"
+    else:
+        text = " ".join(
+            str(row.get(key) or "") for key in ("object_caption", "dense_caption_en", "transcript_en", "qwen_translation")
+        ).lower()
+        ego_actor = any(p in text for p in _EGO_PATTERNS)
+        other_actor = any(p in text for p in _OTHER_PATTERNS)
     verb = normalize_token(str(row.get("verb") or ""))
     transfer = _contains_text_term(
         text,
@@ -867,8 +943,8 @@ def _caption_cues(row: dict[str, Any]) -> dict[str, bool]:
     )
     conflict_cue = any(p in text for p in _CONFLICT_PATTERNS)
     return {
-        "ego_actor": any(p in text for p in _EGO_PATTERNS),
-        "other_actor": any(p in text for p in _OTHER_PATTERNS),
+        "ego_actor": ego_actor,
+        "other_actor": other_actor,
         "ambiguous": any(p in text for p in _AMBIGUOUS_PATTERNS),
         "shared_area": any(p in text for p in ("shared area", "shared table", "shared zone", "table center", "center of the table")),
         "shared_use": any(p in text for p in ("common", "everyone", "together", "communal", "shared object", "for everyone", "used by everyone")),
@@ -1243,4 +1319,3 @@ def _derive_temporal_ownership_signals(
         "contextual_requires_history": contextual_requires_history,
         "current_frame_zone": (current_snapshot or {}).get("target_zone"),
     }
-

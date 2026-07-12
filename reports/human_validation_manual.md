@@ -214,3 +214,37 @@ disagree=424, no_data=0), this is how the first validation pass's worklist was c
 
 This same recipe (stratify agree by taxonomy×label with a 15%/floor-5 rule, take all disagree,
 mark the rest verified-by-policy) should be re-run for ego4d once its `vlm-crosscheck` is available.
+
+## 9. Ego4D dataset on HuggingFace (metadata-only)
+
+`outputs/ego4d/labels_v2.jsonl` (10,304 rows — SAM-3 detections filtered to `object.score ≥ 0.7`,
+down from 12,338) is published at
+**https://huggingface.co/datasets/leejangha1257/ego-ownership-ego4d** (private). It's
+**metadata-only**: no frame images, since Ego4D's license forbids redistributing any portion of
+its videos/frames to a third party (see its "USES NOT PERMITTED" clause) — but our own annotations
+(bboxes, labels, evidence) are unaffected, per the license's "INTELLECTUAL PROPERTY" clause.
+
+Anyone with their own Ego4D video license can reconstruct the exact frames locally and run
+`vlm-crosscheck` against them:
+
+```bash
+huggingface-cli download leejangha1257/ego-ownership-ego4d --repo-type dataset --local-dir .
+
+egoown vlm-crosscheck \
+    --input outputs/ego4d/labels_v2.jsonl \
+    --videos-root /path/to/their/ego4d/videos \
+    --judge anthropic:claude-sonnet-4-6
+```
+
+`--videos-root` points at a directory of `{video_id}.mp4` files (Ego4D's own naming convention).
+`vlm-crosscheck` reconstructs each sparse frame by extracting
+`source_video_start_sec + frame_times_sec[tag]` directly from `videos_root/{video_id}.mp4` via
+ffmpeg (see `_reconstruct_frame_paths` in `src/egoownership/vlm_crosscheck.py`) — verified
+pixel-identical (0.0 mean/max diff) against our own pre-extracted frames.
+
+To also serve these rows in the review UI (`egoown serve`), pass
+`--input outputs/ego4d/labels_v2.jsonl --videos-root /path/to/their/ego4d/videos` and the same
+reconstruction path kicks in for frame display/playback.
+
+For the same reason (no redistributable frames), the egolife dataset — which has no such known
+video-license restriction — is not yet uploaded; only ego4d is published for now.

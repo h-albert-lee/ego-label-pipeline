@@ -1,9 +1,9 @@
 # Auto-Labeling Method: Ground Truth and Taxonomy
 
-This document describes how `one-pass-labels` automatically assigns an ownership ground-truth
+This document describes how `auto-label` automatically assigns an ownership ground-truth
 label (`auto_ground_truth`) and a taxonomy tag (`auto_taxonomy`) to each candidate object.
 
-Implementation: `src/egoownership/catv_evidence_label.py` (`build_evidence_label`,
+Implementation: `src/egoownership/evidence_labeling.py` (`build_evidence_label`,
 `_decide_taxonomy_gt`). Ground-truth values: `MINE`, `PERSON_k`, `SHARED`, `AMBIGUOUS`.
 Taxonomy values: `A` (baseline), `B` (conflict), `C` (contextual), `D` (ambiguous).
 

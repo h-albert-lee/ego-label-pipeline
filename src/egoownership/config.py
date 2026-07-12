@@ -63,3 +63,11 @@ def load_config(path: str | Path | None = None) -> TaxonomyConfig:
 
 def normalize_token(token: str) -> str:
     return token.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def normalize_object_noun(noun: str) -> str:
+    return noun.lower().replace("_", " ").strip()
+
+
+def safe_path_part(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value) or "unknown"

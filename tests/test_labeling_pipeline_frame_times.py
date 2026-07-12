@@ -1,4 +1,4 @@
-from egoownership.catv_pipeline import _jsonl_sparse_frame_times
+from egoownership.labeling_pipeline import _jsonl_sparse_frame_times
 
 
 def test_anchors_on_reference_frame_sec_when_present():

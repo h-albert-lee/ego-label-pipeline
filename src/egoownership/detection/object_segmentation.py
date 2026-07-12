@@ -35,6 +35,7 @@ class Sam2ObjectConfig:
     max_area_ratio: float = 0.75
     max_objects_per_frame: int = 30
     nms_iou_threshold: float = 0.90
+    score_threshold: float = 0.7
 
 
 class Sam2ObjectExtractor:
@@ -156,7 +157,7 @@ class Sam2ObjectExtractor:
             outputs = model(**inputs)
         results = processor.post_process_object_detection(
             outputs,
-            threshold=0.3,
+            threshold=self.cfg.score_threshold,
             target_sizes=[image.size[::-1]],
         )[0]
         boxes = results.get("boxes", [])
@@ -229,7 +230,7 @@ def write_sam2_object_jsonl(
             processed += 1
             if (row.get("source_dataset") or "") in (skip_source_datasets or set()):
                 continue
-            updated, object_count = add_sam2_objects_to_entry(
+            updated, object_count = add_segmented_objects_to_entry(
                 row,
                 frames_root,
                 extractor=extractor,
@@ -246,7 +247,7 @@ def write_sam2_object_jsonl(
     return count
 
 
-def add_sam2_objects_to_entry(
+def add_segmented_objects_to_entry(
     row: dict[str, Any],
     frames_root: Path,
     *,

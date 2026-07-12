@@ -1,6 +1,6 @@
-"""SAM-2 backward bbox tracking for the one-pass-labels stage.
+"""SAM-2 backward bbox tracking for the auto-label stage.
 
-one-pass-labels already has a bbox for frame ``t`` (from SAM-3/CAT-V) and
+auto-label already has a bbox for frame ``t`` (from SAM-3 / object segmentation) and
 already extracts the t-2/t-1/t sparse frame images. Rather than re-tracking
 the whole clip, this propagates the known frame-t box *backward* directly on
 those three already-extracted images, so temporal evidence (zone/held_by
@@ -101,7 +101,7 @@ def track_bbox_backward(
     # Reverse the frames up to and including the reference tag so SAM-2 walks
     # backward in time from the one frame we actually have a box for; any
     # frames after the reference tag (shouldn't normally occur here, since
-    # one-pass-labels' reference is always "t", the last tag) are appended
+    # auto-label' reference is always "t", the last tag) are appended
     # in forward order.
     order = list(reversed(chronological[: ref_pos + 1])) + chronological[ref_pos + 1 :]
 

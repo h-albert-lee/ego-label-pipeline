@@ -152,6 +152,7 @@ function renderScenes() {
     })
     .forEach((s) => {
       const li = document.createElement("li");
+      li.dataset.clipId = s.clip_id;
       if (state.active && state.active.clip.clip_id === s.clip_id) li.classList.add("active");
       const conf = s.auto_label_confidence;
       const confClass = conf == null ? "" : conf < 0.4 ? "low" : conf < 0.75 ? "med" : "high";
@@ -177,6 +178,19 @@ function renderScenes() {
     });
 }
 
+// Just moves the "active" highlight onto the already-rendered <li> for the
+// current record, without rebuilding the whole (potentially 10k+ item,
+// unfiltered by default) sidebar list -- renderScenes() is the expensive
+// full rebuild, needed only when the underlying data actually changed
+// (loadScenes()/refreshSidebar()), not on every plain record navigation.
+function updateActiveHighlight() {
+  if (!els.list) return;
+  const activeId = state.active ? state.active.clip.clip_id : null;
+  Array.from(els.list.children).forEach((li) => {
+    li.classList.toggle("active", !!activeId && li.dataset.clipId === activeId);
+  });
+}
+
 // ---- active scene ----
 async function loadScene(clipId, { focus = true } = {}) {
   state.active = await fetchJSON(`/api/scenes/${encodeURIComponent(clipId)}`);
@@ -191,7 +205,7 @@ async function loadScene(clipId, { focus = true } = {}) {
   state.lastSaved = null;
   await checkVideoAvailability();
   renderActive();
-  renderScenes();
+  updateActiveHighlight();
   if (focus) window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -527,14 +541,21 @@ function vlmEvidenceTextForKey(r, compositeKey) {
 
 // Default rationale suggestion: for each aspect where a VLM judge's overall
 // label *agrees* with the auto label and both sides actually wrote something
-// for that aspect, treat it as corroborated by two independent modes and
-// pre-select it (both the auto checkbox and the matching VLM checkbox).
-// Only applies when nobody has already curated a selection for this row —
-// an existing kev.selected_evidence means a human already made this call.
+// for that aspect, treat it as corroborated by two independent modes — but
+// use only the VLM's sentence in the rationale text (its prose reads more
+// cleanly than concatenating both sides saying the same thing two ways).
+// The auto side isn't pre-selected either, since its text isn't what's being
+// used; only the matching VLM checkbox is. Only applies when nobody has
+// already curated a selection for this row — an existing kev.selected_evidence
+// means a human already made this call.
 function computeDualSupportedDefault(r) {
   const kev = r.auto_key_evidence || {};
-  if ((kev.selected_evidence || []).length) return null;
-  const autoKeys = [];
+  // selected_evidence is only ever set by a human save (the auto pipeline
+  // never writes it) — so its mere presence, even as [], means a human
+  // already saved a decision here (e.g. edited the rationale text with no
+  // checkboxes ticked). Checking .length alone would treat that [] the same
+  // as "never touched" and silently recompute/overwrite the saved rationale.
+  if (kev.selected_evidence != null) return null;
   const vlmKeys = [];
   const sentences = [];
   Object.entries(r.vlm_judgements || {}).forEach(([modelId, judge]) => {
@@ -543,14 +564,13 @@ function computeDualSupportedDefault(r) {
       const autoText = kev[field];
       const vlmText = judge[field];
       if (autoText && vlmText) {
-        autoKeys.push(shortKey);
         vlmKeys.push(vlmCompositeKey(modelId, shortKey));
-        sentences.push(autoText, vlmText);
+        sentences.push(vlmText);
       }
     });
   });
   if (!sentences.length) return null;
-  return { autoKeys, vlmKeys, text: Array.from(new Set(sentences)).join(" ") };
+  return { autoKeys: [], vlmKeys, text: Array.from(new Set(sentences)).join(" ") };
 }
 
 function renderEvidencePanel(r) {
@@ -570,12 +590,11 @@ function renderEvidencePanel(r) {
 
   els.evidencePanel.innerHTML = `
     <div class="evidence-rationale">
-      <div class="evidence-title">Auto rationale for GT choice${suggestion ? ' <small class="hint">(defaulted to evidence both auto + VLM support)</small>' : ""}</div>
+      <div class="evidence-title">Auto rationale for GT choice${suggestion ? ' <small class="hint">(defaulted to VLM\'s sentences, for aspects both auto + VLM support)</small>' : ""}</div>
       <textarea class="evidence-rationale-text" rows="4">${escapeHtml(initialRationale)}</textarea>
       <div class="evidence-actions">
         <button type="button" class="add-selected-evidence">add selected evidence</button>
-        <button type="button" class="save-rationale">save rationale</button>
-        <span class="evidence-save-feedback"></span>
+        <span class="hint">saved together with the main save button (⌘S)</span>
       </div>
     </div>
     <div class="evidence-list">
@@ -592,7 +611,6 @@ function renderEvidencePanel(r) {
   `;
 
   const rationaleText = els.evidencePanel.querySelector(".evidence-rationale-text");
-  const feedback = els.evidencePanel.querySelector(".evidence-save-feedback");
   const selectedKeys = () => [
     ...Array.from(els.evidencePanel.querySelectorAll("[data-evidence-key]:checked")).map((x) => x.dataset.evidenceKey),
     ...Array.from(els.vlmPanel ? els.vlmPanel.querySelectorAll("[data-vlm-evidence-key]:checked") : []).map((x) => x.dataset.vlmEvidenceKey),
@@ -606,29 +624,6 @@ function renderEvidencePanel(r) {
     const current = (rationaleText.value || "").trim();
     const addition = additions.join(" ");
     rationaleText.value = current ? `${current} ${addition}` : addition;
-  };
-
-  els.evidencePanel.querySelector(".save-rationale").onclick = async () => {
-    const payload = {
-      annotator: els.annotator.value || "anonymous",
-      rationale: rationaleText.value || "",
-      selected_evidence: selectedKeys(),
-    };
-    feedback.textContent = "saving…";
-    try {
-      const updated = await fetchJSON(
-        `/api/scenes/${encodeURIComponent(r.clip.clip_id)}/evidence`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
-      );
-      state.active = updated;
-      state.lastSaved = new Date().toLocaleTimeString();
-      feedback.textContent = "saved";
-      renderActive();
-      refreshSidebar();
-    } catch (e) {
-      feedback.textContent = `error: ${e.message || e}`;
-      console.error("rationale update failed", e);
-    }
   };
 
   els.evidencePanel.querySelectorAll(".ev-select").forEach((sel) => {
@@ -902,6 +897,17 @@ function renderEdits(r) {
 async function saveActive({ advance = false } = {}) {
   if (!state.active) return;
   const annotator = els.annotator.value || "anonymous";
+  const clipId = state.active.clip.clip_id;
+  // Evidence-panel rationale/selected-evidence are saved together with the
+  // main save action (⌘S / save button) in the SAME request rather than a
+  // separate one — two sequential requests each trigger their own full
+  // read-modify-write of the (large) scene_records.jsonl, roughly doubling
+  // save latency for no benefit when both are being saved together anyway.
+  const rationaleText = els.evidencePanel ? els.evidencePanel.querySelector(".evidence-rationale-text") : null;
+  const evidenceKeys = rationaleText ? [
+    ...Array.from(els.evidencePanel.querySelectorAll("[data-evidence-key]:checked")).map((x) => x.dataset.evidenceKey),
+    ...Array.from(els.vlmPanel ? els.vlmPanel.querySelectorAll("[data-vlm-evidence-key]:checked") : []).map((x) => x.dataset.vlmEvidenceKey),
+  ] : null;
   const body = {
     annotator,
     scene_label: state.edits.scene_label,
@@ -909,11 +915,14 @@ async function saveActive({ advance = false } = {}) {
     review_status: state.edits.review_status,
     notes: state.edits.notes,
     object_overrides: state.edits.object_overrides,
+    rationale: rationaleText ? (rationaleText.value || "") : null,
+    selected_evidence: evidenceKeys,
   };
+
   els.saveFeedback.textContent = "saving…";
   els.saveFeedback.style.color = "var(--muted)";
   try {
-    const updated = await fetchJSON(`/api/scenes/${encodeURIComponent(state.active.clip.clip_id)}`, {
+    const updated = await fetchJSON(`/api/scenes/${encodeURIComponent(clipId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

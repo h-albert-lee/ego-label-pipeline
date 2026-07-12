@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from egoownership.schema import ClipCandidate, OwnershipLabel, Taxonomy
+from egoownership.tabletop_nouns import caption_mentions_table as _caption_mentions_table
 
 
 TEXT_FIELDS = (
@@ -244,108 +245,6 @@ SERVING_TERMS = {
     "직원",
     "서빙",
 }
-TABLE_CAPTION_TERMS = {
-    "table",
-    "desk",
-    "countertop",
-    "counter",
-    "桌",
-    "桌子",
-    "桌上",
-    "餐桌",
-    "台面",
-}
-CHINESE_VERB_TERMS = (
-    ("拿", "pick_up"),
-    ("取", "pick_up"),
-    ("拿起", "pick_up"),
-    ("放", "place"),
-    ("放进", "place"),
-    ("放到", "place"),
-    ("推", "push"),
-    ("递", "pass"),
-    ("给", "give"),
-    ("洗", "wash"),
-    ("找", "search"),
-    ("翻", "search"),
-    ("看", "look"),
-    ("坐", "sit"),
-    ("站", "stand"),
-    ("走", "walk"),
-    ("指", "point"),
-)
-CHINESE_NOUN_TERMS = (
-    ("椅子", "chair"),
-    ("袋子", "bag"),
-    ("裱花袋", "piping_bag"),
-    ("裱花嘴", "piping_tip"),
-    ("手机", "phone"),
-    ("电脑", "computer"),
-    ("杯子", "cup"),
-    ("杯", "cup"),
-    ("盘子", "plate"),
-    ("碗", "bowl"),
-    ("勺子", "spoon"),
-    ("刀", "knife"),
-    ("叉", "fork"),
-    ("锅", "pot"),
-    ("模具", "mold"),
-    ("磨具", "mold"),
-    ("东西", "object"),
-)
-ENGLISH_VERB_TERMS = (
-    ("pick up", "pick_up"),
-    ("picked up", "pick_up"),
-    ("take", "pick_up"),
-    ("takes", "pick_up"),
-    ("place", "place"),
-    ("places", "place"),
-    ("placed", "place"),
-    ("put", "place"),
-    ("puts", "place"),
-    ("push", "push"),
-    ("pushed", "push"),
-    ("pass", "pass"),
-    ("passes", "pass"),
-    ("give", "give"),
-    ("gives", "give"),
-    ("wash", "wash"),
-    ("search", "search"),
-    ("look", "look"),
-    ("looking", "look"),
-)
-ENGLISH_NOUN_TERMS = (
-    ("box", "box"),
-    ("container", "container"),
-    ("chair", "chair"),
-    ("bag", "bag"),
-    ("piping bag", "piping_bag"),
-    ("piping tip", "piping_tip"),
-    ("phone", "phone"),
-    ("pen", "pen"),
-    ("pencil", "pencil"),
-    ("notebook", "notebook"),
-    ("paper", "paper"),
-    ("book", "book"),
-    ("remote", "remote"),
-    ("remote control", "remote"),
-    ("charger", "charger"),
-    ("cable", "cable"),
-    ("bottle", "bottle"),
-    ("computer", "computer"),
-    ("laptop", "computer"),
-    ("cup", "cup"),
-    ("mug", "cup"),
-    ("plate", "plate"),
-    ("bowl", "bowl"),
-    ("spoon", "spoon"),
-    ("knife", "knife"),
-    ("fork", "fork"),
-    ("pot", "pot"),
-    ("pan", "pan"),
-    ("mold", "mold"),
-    ("object", "object"),
-)
 CHINESE_TRANSLATION_TERMS = (
     ("正在", "is "),
     ("现在", "now "),
@@ -1117,38 +1016,6 @@ def _primary_caption_text(text_by_field: dict[str, str]) -> str:
         if value:
             return value
     return ""
-
-
-def _caption_mentions_table(caption: str) -> bool:
-    lowered = caption.casefold()
-    return any(term.casefold() in lowered for term in TABLE_CAPTION_TERMS)
-
-
-def _extract_caption_verb_nouns(caption: str) -> tuple[str | None, list[str]]:
-    verb: str | None = None
-    for marker, normalized in CHINESE_VERB_TERMS:
-        if marker in caption:
-            verb = normalized
-            break
-    lowered = f" {caption.casefold()} "
-    if verb is None:
-        for marker, normalized in ENGLISH_VERB_TERMS:
-            if re.search(rf"(?<![a-z0-9_]){re.escape(marker)}(?![a-z0-9_])", lowered):
-                verb = normalized
-                break
-    nouns: list[str] = []
-    seen: set[str] = set()
-    for marker, normalized in CHINESE_NOUN_TERMS:
-        if marker in caption and normalized not in seen:
-            nouns.append(normalized)
-            seen.add(normalized)
-    for marker, normalized in ENGLISH_NOUN_TERMS:
-        if normalized in seen:
-            continue
-        if re.search(rf"(?<![a-z0-9_]){re.escape(marker)}s?(?![a-z0-9_])", lowered):
-            nouns.append(normalized)
-            seen.add(normalized)
-    return verb, nouns
 
 
 def _translate_caption_text(caption: str) -> str:
