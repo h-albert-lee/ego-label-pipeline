@@ -362,10 +362,16 @@ class AnthropicOwnershipJudge:
 
     def _load(self) -> Any:
         if self._client is None:
+            import os
+
             import anthropic
-            self._client = anthropic.Anthropic(
-                **({"api_key": self.cfg.api_key} if self.cfg.api_key else {})
+            kwargs: dict[str, Any] = (
+                {"api_key": self.cfg.api_key} if self.cfg.api_key else {}
             )
+            ua = os.environ.get("EGOOWN_ANTHROPIC_USER_AGENT")
+            if ua:
+                kwargs["default_headers"] = {"User-Agent": ua}
+            self._client = anthropic.Anthropic(**kwargs)
         return self._client
 
     def judge(self, frame_paths: list[Path], record: dict[str, Any]) -> dict[str, Any]:
@@ -431,13 +437,23 @@ class OpenAIOwnershipJudge:
                 })
         content.append({"type": "text", "text": _build_prompt(record)})
 
+        # gpt-5 / o-series reasoning models reject `max_tokens` and consume
+        # part of the budget on hidden reasoning tokens, so use
+        # `max_completion_tokens` with extra headroom for them.
+        mid = self.cfg.model_id.lower()
+        is_reasoning = mid.startswith(("gpt-5", "o1", "o3", "o4"))
+        token_kw = (
+            {"max_completion_tokens": max(self.cfg.max_tokens, 2048)}
+            if is_reasoning
+            else {"max_tokens": self.cfg.max_tokens}
+        )
         response = client.chat.completions.create(
             model=self.cfg.model_id,
-            max_tokens=self.cfg.max_tokens,
             messages=[
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": content},
             ],
+            **token_kw,
         )
         raw = response.choices[0].message.content or ""
         return _parse_label_response(raw)
@@ -614,6 +630,7 @@ def write_crosscheck_jsonl(
     limit: int | None = None,
     resume: bool = True,
     show_progress: bool = True,
+    max_workers: int = 1,
 ) -> int:
     """Run all judges on each record in labels_path and write agreement stats.
 
@@ -638,76 +655,129 @@ def write_crosscheck_jsonl(
         records = records[:limit]
 
     todo = [r for r in records if r.get("id") not in existing_ids]
+    reconstruction_cache = out_path.parent / f"{out_path.stem}_reconstructed_frames"
 
+    def _process(record: dict[str, Any]) -> dict[str, Any]:
+        rid = record.get("id", "")
+        auto_gt = record.get("auto_ground_truth") or record.get("auto_label") or ""
+        ref_bbox = (record.get("object") or {}).get("bbox") or {}
+        temporal_objects = record.get("temporal_target_objects") or {}
+
+        # Frame t always gets ref_bbox (the verified anchor). t-1/t-2 get
+        # their own genuinely-tracked box (from --sam2-track) when one
+        # exists for that frame; otherwise they're shown unboxed rather
+        # than falling back to reusing t's box, which used to draw a
+        # stale, unrelated-looking box whenever no real tracked position
+        # existed for that frame — which was most of the time.
+        raw_paths = _resolve_frame_paths(
+            record, frames_root,
+            videos_root=videos_root,
+            reconstruction_cache=reconstruction_cache,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            annotated_paths: list[Path | None] = []
+            for tag, src in zip(("t-2", "t-1", "t"), raw_paths):
+                frame_bbox = ref_bbox if tag == "t" else (temporal_objects.get(tag) or {}).get("bbox")
+                if src and src.exists() and frame_bbox:
+                    dst = tmp_path / f"frame_{tag.replace('-', '_')}_bbox.jpg"
+                    _draw_bbox_on_frame(src, dst, frame_bbox)
+                    annotated_paths.append(dst)
+                else:
+                    annotated_paths.append(src)  # no genuine box for this frame: shown unboxed
+
+            frame_paths = [p for p in annotated_paths if p and Path(p).exists()]
+
+            judge_results: dict[str, dict] = {}
+            for judge in judges:
+                try:
+                    result = judge.judge(frame_paths, record)
+                except Exception as exc:
+                    result = {"label": "ERROR", **{f: "" for f in _EVIDENCE_FIELDS}, "error": str(exc)[:200]}
+                result["agrees"] = (result.get("label") == auto_gt)
+                judge_results[judge.model_id] = result
+
+        labels_predicted = [v["label"] for v in judge_results.values() if v["label"] in VALID_LABELS]
+        agreement_count = sum(1 for v in judge_results.values() if v.get("agrees"))
+        majority_label = Counter(labels_predicted).most_common(1)[0][0] if labels_predicted else "UNKNOWN"
+
+        return {
+            "id": rid,
+            "guideline_version": GUIDELINE_VERSION,
+            "auto_ground_truth": auto_gt,
+            "judges": judge_results,
+            "agreement_count": agreement_count,
+            # Ratio over judges that produced a valid label — ERROR/UNKNOWN
+            # judges shouldn't deflate agreement for the remaining ones.
+            "n_valid_judges": len(labels_predicted),
+            "agreement_ratio": round(agreement_count / max(1, len(labels_predicted)), 4),
+            "majority_label": majority_label,
+            "majority_agrees": majority_label == auto_gt,
+        }
+
+    # Judges lazily build their HTTP client on first .judge() call; the
+    # check-then-create in _load() isn't thread-safe, so warm each one up
+    # once up front before any worker threads touch it.
+    for judge in judges:
+        loader = getattr(judge, "_load", None)
+        if callable(loader):
+            try:
+                loader()
+            except Exception:
+                pass
+
+    progress = None
     if show_progress:
         try:
             from tqdm.auto import tqdm
-            todo = tqdm(todo, total=len(todo), unit="record", desc="vlm-crosscheck")
+            progress = tqdm(total=len(todo), unit="record", desc="vlm-crosscheck")
         except ImportError:
             pass
 
     n_written = 0
     mode = "a" if resume else "w"
     with out_path.open(mode, encoding="utf-8") as fh:
-        for record in todo:
-            rid = record.get("id", "")
-            auto_gt = record.get("auto_ground_truth") or record.get("auto_label") or ""
-            ref_bbox = (record.get("object") or {}).get("bbox") or {}
-            temporal_objects = record.get("temporal_target_objects") or {}
-
-            # Frame t always gets ref_bbox (the verified anchor). t-1/t-2 get
-            # their own genuinely-tracked box (from --sam2-track) when one
-            # exists for that frame; otherwise they're shown unboxed rather
-            # than falling back to reusing t's box, which used to draw a
-            # stale, unrelated-looking box whenever no real tracked position
-            # existed for that frame — which was most of the time.
-            raw_paths = _resolve_frame_paths(
-                record, frames_root,
-                videos_root=videos_root,
-                reconstruction_cache=out_path.parent / f"{out_path.stem}_reconstructed_frames",
-            )
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp_path = Path(tmp)
-                annotated_paths: list[Path | None] = []
-                for tag, src in zip(("t-2", "t-1", "t"), raw_paths):
-                    frame_bbox = ref_bbox if tag == "t" else (temporal_objects.get(tag) or {}).get("bbox")
-                    if src and src.exists() and frame_bbox:
-                        dst = tmp_path / f"frame_{tag.replace('-', '_')}_bbox.jpg"
-                        _draw_bbox_on_frame(src, dst, frame_bbox)
-                        annotated_paths.append(dst)
-                    else:
-                        annotated_paths.append(src)  # no genuine box for this frame: shown unboxed
-
-                frame_paths = [p for p in annotated_paths if p and Path(p).exists()]
-
-                judge_results: dict[str, dict] = {}
-                for judge in judges:
+        if max_workers <= 1:
+            for record in todo:
+                row = _process(record)
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fh.flush()
+                n_written += 1
+                if progress is not None:
+                    progress.update(1)
+        else:
+            # Parallelize across records: the per-record cost is dominated by
+            # the judge's network round-trip, so a small thread pool (I/O-bound)
+            # gives a near-linear speedup. Each worker uses its own temp dir and
+            # the judge HTTP clients are safe for concurrent requests; only the
+            # single output writer below is shared, kept on this thread.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_process, rec): rec for rec in todo}
+                for fut in as_completed(futures):
                     try:
-                        result = judge.judge(frame_paths, record)
+                        row = fut.result()
                     except Exception as exc:
-                        result = {"label": "ERROR", **{f: "" for f in _EVIDENCE_FIELDS}, "error": str(exc)[:200]}
-                    result["agrees"] = (result.get("label") == auto_gt)
-                    judge_results[judge.model_id] = result
+                        rec = futures[fut]
+                        row = {
+                            "id": rec.get("id", ""),
+                            "guideline_version": GUIDELINE_VERSION,
+                            "auto_ground_truth": rec.get("auto_ground_truth")
+                            or rec.get("auto_label") or "",
+                            "judges": {},
+                            "agreement_count": 0,
+                            "n_valid_judges": 0,
+                            "agreement_ratio": 0.0,
+                            "majority_label": "ERROR",
+                            "majority_agrees": False,
+                            "error": str(exc)[:200],
+                        }
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    n_written += 1
+                    if progress is not None:
+                        progress.update(1)
 
-            labels_predicted = [v["label"] for v in judge_results.values() if v["label"] in VALID_LABELS]
-            agreement_count = sum(1 for v in judge_results.values() if v.get("agrees"))
-            majority_label = Counter(labels_predicted).most_common(1)[0][0] if labels_predicted else "UNKNOWN"
-
-            row = {
-                "id": rid,
-                "guideline_version": GUIDELINE_VERSION,
-                "auto_ground_truth": auto_gt,
-                "judges": judge_results,
-                "agreement_count": agreement_count,
-                # Ratio over judges that produced a valid label — ERROR/UNKNOWN
-                # judges shouldn't deflate agreement for the remaining ones.
-                "n_valid_judges": len(labels_predicted),
-                "agreement_ratio": round(agreement_count / max(1, len(labels_predicted)), 4),
-                "majority_label": majority_label,
-                "majority_agrees": majority_label == auto_gt,
-            }
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-            fh.flush()
-            n_written += 1
-
+    if progress is not None:
+        progress.close()
     return n_written

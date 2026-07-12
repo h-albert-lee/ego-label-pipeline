@@ -213,6 +213,9 @@ def vlm_crosscheck_cmd(
     ),
     limit: int = typer.Option(0, help="Max records (0 = all)"),
     overwrite: bool = typer.Option(False, help="Overwrite output instead of resuming"),
+    workers: int = typer.Option(
+        1, help="Concurrent judge calls (I/O-bound; 5-10 is a good range)"
+    ),
 ):
     """Run independent VLM judges over labels.jsonl and record agreement stats.
 
@@ -261,6 +264,7 @@ def vlm_crosscheck_cmd(
         videos_root=videos_root,
         limit=limit if limit > 0 else None,
         resume=not overwrite,
+        max_workers=workers,
     )
     _CONSOLE.print(f"[green]Cross-checked {n} records[/green] → {resolved_out}")
 
