@@ -313,7 +313,11 @@ def stage_label(
         if needs_tracking:
             frames = assign_instance_ids(frames)
         depth_bands = d.get("depth_bands")
-        frames_with_own = assign_ownership(frames, wearer_depth_bands=depth_bands)
+        frames_with_own = assign_ownership(
+            frames,
+            wearer_depth_bands=depth_bands,
+            clip_narration=getattr(clip, "narration", None),
+        )
         scene: SceneRecord = build_scene_record(clip, frames_with_own)
 
         if judge is not None:

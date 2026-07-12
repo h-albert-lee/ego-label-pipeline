@@ -1,22 +1,34 @@
 """Rule-based ownership assignment with dynamic zones + instance tracking.
 
-The classification cascade per object on each frame:
+The classification cascade per object on each frame (guideline v2):
 
-1. **held_by relations** — if a Relation says the object is ``held_by`` a
-   person_id, label PERSON_k. If held_by the wearer's hand bbox, label MINE.
-2. **person_zones** — if the bbox center sits inside a person's influence
-   rectangle, label PERSON_k.
-3. **wearer near zone** — if cy >= zones.mine_y_min, MINE.
+1. **held_by relations** — possession is evidence, not ownership:
+   * held by a tracked person → communal-function noun stays SHARED
+     (communal persistence), otherwise PERSON_k.
+   * held by a hand: a bare "hand" bbox is NOT assumed to be the wearer's.
+     When the clip narration's actor is a third person (Ego4D ``#O`` /
+     third-person subject), the hand is treated as theirs → 2×2 rule
+     (communal → SHARED, personal → PERSON_k). Only with a wearer-actor
+     (or actor-unknown, e.g. EPIC-style wearer-implicit narrations) does a
+     hand-held personal object become MINE.
+2. **person_zones** — bbox center in a person's influence rectangle →
+   communal noun SHARED, else PERSON_k (place-setting attribution).
+3. **wearer near zone / depth** — proximity to the wearer suggests MINE
+   only for personal-function objects; communal-function objects stay
+   SHARED even deep inside the wearer zone (guideline rule 2 / scenario B-2).
 4. **shared band** — central horizontal band, SHARED.
-5. **depth refinement** — when ``mean_depth`` is available and < the
-   wearer-depth band lower bound, override to MINE.
-6. Fallback AMBIGUOUS.
+5. Fallback AMBIGUOUS.
 
 Scene-level label is then derived per object instance via the (t-2, t-1, t)
 trajectory: stable → that label, transition → the *final* label.
+
+Every evidence list is stamped with ``cascade:<CASCADE_VERSION>`` so labels
+produced by different cascade revisions stay distinguishable downstream.
 """
 
 from __future__ import annotations
+
+import re
 
 from collections import Counter
 
@@ -32,6 +44,49 @@ from egoownership.schema import (
     Relation,
     SceneRecord,
 )
+
+
+CASCADE_VERSION = "guideline-v2-2026-07-09"
+
+# Inherently communal-function nouns (guideline v2 rule 2/3). Overridable via
+# a `communal_function_nouns` attribute on TaxonomyConfig if present.
+_COMMUNAL_FUNCTION_NOUNS = frozenset({
+    "serving spoon", "serving plate", "serving bowl", "platter", "tongs",
+    "ladle", "pitcher", "jug", "teapot", "kettle", "sauce", "ketchup",
+    "condiment", "dressing", "salt", "pepper", "tissue", "napkin",
+    "shared bottle", "water bottle",
+})
+
+# Third-person subject heuristics for narrations. Ego4D tags the camera
+# wearer as "#C"; "#O" marks narrations about other people. Free-form
+# narrations name others as "the woman V", "man X", etc.
+_OTHER_SUBJECT_RE = re.compile(
+    r"^\s*(?:#O\b|the\s+)?(?:man|woman|person|lady|guy|boy|girl)\s+[A-Z]\b",
+    re.IGNORECASE,
+)
+_WEARER_TAG_RE = re.compile(r"^\s*#C\b")
+
+
+def narration_actor(narration: str | None) -> str | None:
+    """Classify the narration's primary actor: 'wearer' | 'other' | None.
+
+    None (unknown) is treated downstream like a wearer-implicit narration —
+    EPIC-style datasets narrate the wearer's own actions without tags, and
+    over-firing PERSON_k there would be worse than the status quo.
+    """
+    if not narration or not isinstance(narration, str):
+        return None
+    if _WEARER_TAG_RE.search(narration):
+        return "wearer"
+    if narration.lstrip().startswith("#O") or _OTHER_SUBJECT_RE.search(narration):
+        return "other"
+    return None
+
+
+def _is_communal(label: str, cfg: TaxonomyConfig | None = None) -> bool:
+    nouns = getattr(cfg, "communal_function_nouns", None) or _COMMUNAL_FUNCTION_NOUNS
+    low = (label or "").lower()
+    return any(n in low for n in nouns)
 
 
 def _ensure_zones(frame: FrameDetections, yaml_zones: OwnershipZones) -> FrameZones:
@@ -52,46 +107,78 @@ def _classify_with_zones(
     relations: list[Relation],
     yaml_zones: OwnershipZones,
     wearer_depth_band: tuple[float, float] | None = None,
+    cfg: TaxonomyConfig | None = None,
+    actor: str | None = None,
 ) -> tuple[OwnershipLabel, list[str]]:
-    """Return (label, evidence_list)."""
-    evidence: list[str] = []
+    """Return (label, evidence_list).
+
+    ``actor`` is the narration-level primary actor ('wearer'/'other'/None),
+    used to disambiguate bare hand detections (guideline v2 fix for MINE
+    over-assignment: a hand in an egocentric frame is not necessarily the
+    wearer's).
+    """
+    evidence: list[str] = [f"cascade:{CASCADE_VERSION}"]
+    communal = _is_communal(det.label, cfg)
 
     if det.bbox.area < yaml_zones.min_bbox_area_ratio:
-        return OwnershipLabel.AMBIGUOUS, ["bbox-too-small"]
+        return OwnershipLabel.AMBIGUOUS, evidence + ["bbox-too-small"]
 
-    # 1. Possession relations.
+    # 1. Possession relations — possession is evidence, not ownership.
     for rel in relations:
         if rel.predicate != "held_by" or rel.subject_id != det.instance_id:
             continue
         target = rel.object_id
         if target.startswith("person_"):
+            if communal:
+                evidence.append(f"held_by:{target}+communal-persistence")
+                return OwnershipLabel.SHARED, evidence
             evidence.append(f"held_by:{target}")
             return OwnershipLabel.PERSON_K, evidence
         if target in {"wearer", "hand"} or target.startswith("hand"):
-            evidence.append(f"held_by:wearer({target})")
-            return OwnershipLabel.MINE, evidence
+            hand_is_wearer = target == "wearer" or actor != "other"
+            if communal:
+                evidence.append(f"held_by:{target}+communal-persistence")
+                return OwnershipLabel.SHARED, evidence
+            if hand_is_wearer:
+                evidence.append(f"held_by:wearer({target})")
+                return OwnershipLabel.MINE, evidence
+            # Bare hand + third-person actor → the hand is theirs (2×2 rule).
+            evidence.append(f"held_by:{target}+third-party-actor")
+            return OwnershipLabel.PERSON_K, evidence
 
-    # 2. Person influence zones.
+    # 2. Person influence zones (place-setting attribution).
     for pid, zone in zones.person_zones.items():
         # Use IoU rather than pure containment so partial overlap still wins.
         iou = zone.iou(det.bbox)
         if iou > 0.05:
+            if communal:
+                evidence.append(f"in-person-zone:{pid}({iou:.2f})+communal-persistence")
+                return OwnershipLabel.SHARED, evidence
             evidence.append(f"in-person-zone:{pid}({iou:.2f})")
             return OwnershipLabel.PERSON_K, evidence
 
     cx, cy = det.bbox.center
 
-    # 5. Depth shortcut to MINE if available.
+    # 3a. Depth proximity → MINE, personal-function objects only
+    # (communal objects stay SHARED even deep in the wearer zone; B-2).
     if (
         det.mean_depth is not None
         and wearer_depth_band is not None
         and det.mean_depth >= wearer_depth_band[0]
     ):
+        if communal:
+            evidence.append(f"depth-near({det.mean_depth:.2f})+communal-persistence")
+            return OwnershipLabel.SHARED, evidence
         evidence.append(f"depth-near({det.mean_depth:.2f})")
         return OwnershipLabel.MINE, evidence
 
-    # 3. Wearer near zone.
+    # 3b. Wearer near zone → MINE, personal-function objects only.
     if cy >= zones.mine_y_min:
+        if communal:
+            evidence.append(
+                f"y={cy:.2f}>=mine_y_min={zones.mine_y_min:.2f}+communal-persistence"
+            )
+            return OwnershipLabel.SHARED, evidence
         evidence.append(f"y={cy:.2f}>=mine_y_min={zones.mine_y_min:.2f}")
         return OwnershipLabel.MINE, evidence
 
@@ -124,18 +211,23 @@ def assign_ownership(
     cfg: TaxonomyConfig | None = None,
     *,
     wearer_depth_bands: list[tuple[float, float] | None] | None = None,
+    clip_narration: str | None = None,
 ) -> list[FrameDetections]:
     """Mutate detections with an ``ownership`` label for each object.
 
     ``wearer_depth_bands`` is one entry per frame (or None). If absent, depth
-    is ignored.
+    is ignored. ``clip_narration`` (when available) disambiguates whether a
+    bare hand detection belongs to the wearer or a third person; per-frame
+    narrations on FrameDetections take precedence.
     """
 
     cfg = cfg or load_config()
+    clip_actor = narration_actor(clip_narration)
     out: list[FrameDetections] = []
     for i, fd in enumerate(frames):
         zones = _ensure_zones(fd, cfg.zones)
         depth_band = wearer_depth_bands[i] if wearer_depth_bands else None
+        actor = narration_actor(fd.narration) or clip_actor
         new_objs: list[ObjectDetection] = []
         for obj in fd.objects:
             label, evidence = _classify_with_zones(
@@ -145,6 +237,8 @@ def assign_ownership(
                 fd.relations,
                 cfg.zones,
                 wearer_depth_band=depth_band,
+                cfg=cfg,
+                actor=actor,
             )
             new_objs.append(
                 obj.model_copy(update={"ownership": label, "ownership_evidence": evidence})
