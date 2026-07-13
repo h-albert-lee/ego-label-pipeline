@@ -158,7 +158,34 @@ _EVIDENCE_FIELDS = (
 )
 
 
-def _build_prompt(record: dict[str, Any]) -> str:
+def _narration_block(record: dict[str, Any]) -> str | None:
+    """A narration+verb evidence block for the with-narration judge stage.
+
+    The narration says *what happens*, which disambiguates the actor — but it
+    is deliberately framed as a possession/action cue, not an ownership verdict,
+    so the judge still reasons ownership separately (holding is not owning).
+    """
+    narr = (record.get("dense_caption_en") or record.get("narration") or "").strip()
+    if not narr:
+        return None
+    verb = record.get("verb")
+    lines = [
+        "Video narration (a cue to WHAT is happening and WHO is acting — not a",
+        "statement of who owns the object; the boundary rules above still decide",
+        "ownership, and holding/acting is not owning):",
+        f'  "{narr}"',
+        "  Narrator tags: '#C' = an action by the camera wearer; '#O' = an action",
+        "  by ANOTHER person. A named third-person subject ('the woman V', 'man X')",
+        "  is likewise another person, not the wearer. Identify the actor from this,",
+        "  then decide ownership separately. If the frames + narration still don't",
+        "  attribute the object to anyone, answer AMBIGUOUS rather than guessing.",
+    ]
+    if verb:
+        lines.append(f"  Action verb: {verb}")
+    return "\n".join(lines)
+
+
+def _build_prompt(record: dict[str, Any], *, with_narration: bool = False) -> str:
     noun = str((record.get("object") or {}).get("label") or record.get("nouns", ["object"])[0])
 
     label_order = _label_order_for(record)
@@ -166,6 +193,8 @@ def _build_prompt(record: dict[str, Any]) -> str:
         f"  {_LABEL_DEF_LINES[label]}" for label in label_order
     )
     label_enum = "|".join(label_order)
+
+    narration_block = _narration_block(record) if with_narration else None
 
     lines = [
         f"Target object: {noun}",
@@ -181,6 +210,8 @@ def _build_prompt(record: dict[str, Any]) -> str:
         "  • frame t-1  (1 second before the action)",
         "  • frame t    (the action moment — always boxed)",
         "",
+        narration_block,
+        "" if narration_block else None,
         _EVIDENCE_ASPECTS,
         "Respond ONLY with valid JSON (no markdown fences), one sentence per field. "
         "If an aspect isn't determinable from the frames, omit that field entirely — "
@@ -352,12 +383,16 @@ class AnthropicOwnershipJudgeConfig:
     model_id: str = "claude-sonnet-4-6"
     max_tokens: int = 512
     api_key: str | None = None  # falls back to ANTHROPIC_API_KEY env var
+    # "frames-only" (independent audit) or "with-narration" (adjudication stage
+    # that additionally sees the narration + verb). Never aggregate the two.
+    evidence_mode: str = "frames-only"
 
 
 class AnthropicOwnershipJudge:
     def __init__(self, cfg: AnthropicOwnershipJudgeConfig | None = None):
         self.cfg = cfg or AnthropicOwnershipJudgeConfig()
         self.model_id = self.cfg.model_id
+        self.evidence_mode = self.cfg.evidence_mode
         self._client: Any = None
 
     def _load(self) -> Any:
@@ -386,7 +421,8 @@ class AnthropicOwnershipJudge:
                     "type": "image",
                     "source": {"type": "base64", "media_type": "image/jpeg", "data": data},
                 })
-        content.append({"type": "text", "text": _build_prompt(record)})
+        prompt = _build_prompt(record, with_narration=self.evidence_mode == "with-narration")
+        content.append({"type": "text", "text": prompt})
 
         response = client.messages.create(
             model=self.cfg.model_id,
@@ -695,15 +731,20 @@ def write_crosscheck_jsonl(
                 except Exception as exc:
                     result = {"label": "ERROR", **{f: "" for f in _EVIDENCE_FIELDS}, "error": str(exc)[:200]}
                 result["agrees"] = (result.get("label") == auto_gt)
+                # Stamp what this judge saw, so frames-only and with-narration
+                # results are never silently aggregated together.
+                result["evidence_mode"] = getattr(judge, "evidence_mode", "frames-only")
                 judge_results[judge.model_id] = result
 
         labels_predicted = [v["label"] for v in judge_results.values() if v["label"] in VALID_LABELS]
         agreement_count = sum(1 for v in judge_results.values() if v.get("agrees"))
         majority_label = Counter(labels_predicted).most_common(1)[0][0] if labels_predicted else "UNKNOWN"
 
+        modes = {v.get("evidence_mode", "frames-only") for v in judge_results.values()}
         return {
             "id": rid,
             "guideline_version": GUIDELINE_VERSION,
+            "evidence_mode": modes.pop() if len(modes) == 1 else "mixed",
             "auto_ground_truth": auto_gt,
             "judges": judge_results,
             "agreement_count": agreement_count,
