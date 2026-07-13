@@ -63,6 +63,7 @@ class SceneStore:
                     "auto_label_confidence": rec.auto_label_confidence,
                     "n_objects": sum(len(f.objects) for f in rec.frames),
                     "n_edits": len(rec.edits),
+                    "assigned_to": rec.assigned_to,
                 }
             )
         return out

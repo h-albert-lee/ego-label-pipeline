@@ -87,8 +87,12 @@ const els = {
 };
 
 // ---- preference persistence ----
-els.annotator.value = localStorage.getItem("egoown.annotator") || "";
-els.annotator.addEventListener("change", () => localStorage.setItem("egoown.annotator", els.annotator.value || ""));
+els.annotator.value = new URLSearchParams(location.search).get("annotator")
+  || localStorage.getItem("egoown.annotator") || "";
+els.annotator.addEventListener("change", () => {
+  localStorage.setItem("egoown.annotator", els.annotator.value || "");
+  loadScenes();  // audit mode: re-scope the list to this reviewer
+});
 els.autoAdvance.checked = localStorage.getItem("egoown.autoAdvance") !== "0";
 els.autoAdvance.addEventListener("change", () => localStorage.setItem("egoown.autoAdvance", els.autoAdvance.checked ? "1" : "0"));
 
@@ -115,8 +119,28 @@ async function loadScenes() {
   if (els.filterTaxonomy.value) params.set("taxonomy", els.filterTaxonomy.value);
   if (els.filterLabel.value) params.set("label", els.filterLabel.value);
   if (els.filterSort.value) params.set("sort", els.filterSort.value);
+  // Audit mode: ?annotator=NAME (URL) or the annotator box scopes the list to
+  // this reviewer's assigned scenes only.
+  const who = new URLSearchParams(location.search).get("annotator") || els.annotator.value;
+  if (who) params.set("annotator", who);
   state.scenes = await fetchJSON(`/api/scenes?${params}`);
   renderScenes();
+  updateAuditProgress(who);
+}
+
+async function updateAuditProgress(who) {
+  try {
+    const p = await fetchJSON(`/api/progress${who ? `?annotator=${encodeURIComponent(who)}` : ""}`);
+    if (!els.progressText) return;
+    if (who && p.total != null) {
+      els.progressText.textContent = `${who}: ${p.done}/${p.total} 검수 완료 (${p.remaining} 남음)`;
+      if (els.progressFill) els.progressFill.style.width = p.total ? `${100 * p.done / p.total}%` : "0%";
+    } else if (p.overall) {
+      const o = p.overall;
+      els.progressText.textContent = `전체 ${o.done}/${o.total}${p.all_complete ? " ✅ 완료" : ""}`;
+      if (els.progressFill) els.progressFill.style.width = o.total ? `${100 * o.done / o.total}%` : "0%";
+    }
+  } catch (e) { /* progress is best-effort */ }
 }
 
 function renderScenes() {

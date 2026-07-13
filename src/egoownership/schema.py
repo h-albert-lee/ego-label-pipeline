@@ -199,6 +199,8 @@ class SceneRecord(BaseModel):
     scene_taxonomy: Taxonomy | None = None
     notes: str | None = None
     auto_label_confidence: float | None = None
-    review_status: Literal["draft", "in_review", "verified", "rejected"] = "draft"
+    review_status: Literal["draft", "in_review", "verified", "rejected", "auto_accepted"] = "draft"
     edits: list[AnnotationEdit] = Field(default_factory=list)
     vlm_judgement: VLMJudgement | None = None
+    # Annotators this scene is assigned to (audit workflow; empty = unassigned).
+    assigned_to: list[str] = Field(default_factory=list)

@@ -97,6 +97,7 @@ def create_app(
         status: str | None = None,
         taxonomy: str | None = None,
         label: str | None = None,
+        annotator: str | None = None,
         sort: str = "default",  # default | confidence-asc | confidence-desc
     ) -> list[dict[str, Any]]:
         rows = store.list_summaries()
@@ -106,6 +107,9 @@ def create_app(
             rows = [r for r in rows if r["taxonomy"] == taxonomy]
         if label:
             rows = [r for r in rows if r["scene_label"] == label]
+        if annotator:
+            # Audit workflow: each annotator sees only their assigned scenes.
+            rows = [r for r in rows if annotator in (r.get("assigned_to") or [])]
         if sort == "confidence-asc":
             rows.sort(key=lambda r: (r["auto_label_confidence"] is None, r["auto_label_confidence"] or 0))
         elif sort == "confidence-desc":
@@ -133,6 +137,29 @@ def create_app(
         if updated is None:
             raise HTTPException(status_code=404, detail=f"clip {clip_id!r} not found")
         return updated.model_dump(mode="json")
+
+    @app.get("/api/progress")
+    def progress(annotator: str | None = None) -> dict[str, Any]:
+        """Audit progress: n done / total assigned. Per-annotator if given,
+        else overall across the audit set. 'done' = the annotator has an edit
+        on that scene (or, overall, the scene is verified/rejected)."""
+        rows = store.list_summaries()
+        audit = [r for r in rows if (r.get("assigned_to") or [])]
+        if annotator:
+            mine = [r for r in audit if annotator in r["assigned_to"]]
+            done = sum(1 for r in mine if r["n_edits"] > 0)
+            return {"annotator": annotator, "done": done, "total": len(mine),
+                    "remaining": len(mine) - done}
+        per = {}
+        for r in audit:
+            for a in r["assigned_to"]:
+                per.setdefault(a, {"done": 0, "total": 0})
+                per[a]["total"] += 1
+                if r["n_edits"] > 0:
+                    per[a]["done"] += 1
+        done_all = sum(1 for r in audit if r["review_status"] in {"verified", "rejected"})
+        return {"overall": {"done": done_all, "total": len(audit)},
+                "per_annotator": per, "all_complete": done_all == len(audit)}
 
     @app.get("/api/next-draft")
     def next_draft(after: str | None = None) -> dict[str, Any]:
@@ -171,11 +198,13 @@ def create_app(
 
     @app.get("/frames/{path:path}")
     def frame(path: str):
-        full = (frames_root / path).resolve()
-        try:
-            full.relative_to(frames_root.resolve())
-        except ValueError:
+        # Guard against ".." traversal on the *request* path, then join. We do
+        # NOT require the resolved file to stay under frames_root, so a
+        # frames_root that fans out to per-dataset symlinks (merged audit set)
+        # still serves — the symlinks are set up by us, not user input.
+        if ".." in Path(path).parts or Path(path).is_absolute():
             raise HTTPException(status_code=400, detail="path escape")
+        full = (frames_root / path).resolve()
         if not full.exists():
             raise HTTPException(status_code=404, detail="frame not found")
         return FileResponse(full)
