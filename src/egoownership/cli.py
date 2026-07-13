@@ -216,6 +216,11 @@ def vlm_crosscheck_cmd(
     workers: int = typer.Option(
         1, help="Concurrent judge calls (I/O-bound; 5-10 is a good range)"
     ),
+    evidence_mode: str = typer.Option(
+        "frames-only",
+        help="frames-only (independent audit) | with-narration (adjudication: "
+        "judge also sees narration+verb). Never aggregate the two.",
+    ),
 ):
     """Run independent VLM judges over labels.jsonl and record agreement stats.
 
@@ -243,7 +248,9 @@ def vlm_crosscheck_cmd(
         backend = backend.lower()
         model_id = model_id or backend
         if backend == "anthropic":
-            return AnthropicOwnershipJudge(AnthropicOwnershipJudgeConfig(model_id=model_id))
+            return AnthropicOwnershipJudge(
+                AnthropicOwnershipJudgeConfig(model_id=model_id, evidence_mode=evidence_mode)
+            )
         if backend == "openai":
             return OpenAIOwnershipJudge(OpenAIOwnershipJudgeConfig(model_id=model_id))
         if backend == "gemini":
