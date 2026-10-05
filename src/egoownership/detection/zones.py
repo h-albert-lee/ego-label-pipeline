@@ -15,6 +15,8 @@ show *which* rule fired.
 
 from __future__ import annotations
 
+import statistics
+
 from egoownership.config import OwnershipZones
 from egoownership.schema import BBox, FrameZones, PersonDetection
 
@@ -29,17 +31,27 @@ def static_zones(yaml_zones: OwnershipZones) -> FrameZones:
 
 
 def person_relative_zones(
-    persons: list[PersonDetection], yaml_zones: OwnershipZones
+    persons: list[PersonDetection],
+    yaml_zones: OwnershipZones,
+    *,
+    wearer_floor: str = "lowest",
 ) -> FrameZones:
-    """Derive zones by treating each visible person as a PERSON_k anchor."""
+    """Derive zones by treating each visible person as a PERSON_k anchor.
+
+    ``wearer_floor`` picks the person bbox bottom that the wearer's near zone
+    starts below. ``"lowest"`` assumes everyone sits opposite the wearer. When
+    people sit round a table, one seated at its side has a tall bbox that drags
+    the floor to the bottom of the frame and hands the whole table to the others
+    — ``"median"`` ignores that outlier.
+    """
 
     if not persons:
         return static_zones(yaml_zones)
 
-    # Wearer's near zone starts just below the lowest person bbox bottom.
-    # If the lowest person is high in the frame, we keep a permissive default.
-    lowest_y = max(p.bbox.y_max for p in persons)
-    mine_y_min = max(0.45, min(0.85, lowest_y + 0.05))
+    # Wearer's near zone starts just below the chosen person bbox bottom.
+    bottoms = [p.bbox.y_max for p in persons]
+    anchor = statistics.median(bottoms) if wearer_floor == "median" else max(bottoms)
+    mine_y_min = max(0.45, min(0.85, anchor + 0.05))
 
     # SHARED band spans between leftmost and rightmost person centers.
     x_centers = sorted(p.bbox.center[0] for p in persons)

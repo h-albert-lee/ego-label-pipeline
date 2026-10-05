@@ -5,8 +5,9 @@ We compute three families of relations on the *t* (final) frame:
 * **Spatial**: ``next_to`` (centers within 0.10 norm distance), ``on_table``
   (object overlaps the SHARED band horizontally and is below the persons),
   ``in_front_of_wearer`` (object below the wearer y_min).
-* **Possession**: ``held_by``: an object whose bbox overlaps a "hand" detection
-  (or a person's hand zone — bottom 1/3 of the person bbox).
+* **Possession**: ``held_by``: an object whose bbox overlaps a detected hand,
+  naming that hand's owner (``wearer`` or ``person_<n>``); where no hand was
+  detected, the older approximation (lower 40% of the person bbox) stands in.
 * **Cross-frame**: ``moved_to`` — same instance ID with center displacement
   > 0.15 norm. Useful evidence for Contextual scenes.
 
@@ -24,10 +25,13 @@ from egoownership.schema import (
 )
 
 
-def _dist_centers(a: BBox, b: BBox) -> float:
-    ax, ay = a.center
-    bx, by = b.center
-    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+HAND_LABEL = "hand"
+"""Label marking a detected-hand entry in ``FrameDetections.objects``. Matched
+exactly, never as a substring — ``handbag``/``handle`` are real target nouns."""
+
+
+def _is_hand(obj: ObjectDetection) -> bool:
+    return obj.label == HAND_LABEL
 
 
 def _hand_zone_for(person: PersonDetection) -> BBox:
@@ -42,9 +46,18 @@ def _hand_zone_for(person: PersonDetection) -> BBox:
     )
 
 
+def _dist_centers(a: BBox, b: BBox) -> float:
+    ax, ay = a.center
+    bx, by = b.center
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+
 def spatial_relations(frame: FrameDetections) -> list[Relation]:
     rels: list[Relation] = []
-    objs = frame.objects
+    # Hands live in `objects` only so possession_relations can reach them; they
+    # are not scene objects, and letting them generate next_to/on_table edges
+    # would bury the target's real spatial evidence in noise.
+    objs = [o for o in frame.objects if not _is_hand(o)]
     zones = frame.zones
 
     for i, a in enumerate(objs):
@@ -86,26 +99,28 @@ def spatial_relations(frame: FrameDetections) -> list[Relation]:
 
 def possession_relations(frame: FrameDetections) -> list[Relation]:
     rels: list[Relation] = []
-
-    # Hand-detection-based possession.
-    hands = [o for o in frame.objects if "hand" in o.label.lower()]
-    objects = [o for o in frame.objects if "hand" not in o.label.lower() and o.instance_id]
+    hands = [o for o in frame.objects if _is_hand(o)]
+    objects = [o for o in frame.objects if not _is_hand(o) and o.instance_id]
     for hand in hands:
         for obj in objects:
-            if hand.bbox.iou(obj.bbox) > 0.05:
+            iou = hand.bbox.iou(obj.bbox)
+            if iou > 0.05:
                 rels.append(
                     Relation(
                         subject_id=obj.instance_id,
                         object_id=hand.instance_id or "hand",
                         predicate="held_by",
-                        score=hand.bbox.iou(obj.bbox),
+                        score=iou,
                         note="hand-bbox-overlap",
                     )
                 )
 
-    # Person-hand-zone possession.
+    # Person-hand-zone possession — the pre-hand-detection approximation, kept
+    # as a fallback for people whose hand the "a hand." query missed. Where the
+    # hand was detected it would only restate the same claim with a worse box.
+    owners_with_detected_hands = {h.instance_id for h in hands if h.instance_id}
     for person in frame.persons:
-        if not person.person_id:
+        if not person.person_id or person.person_id in owners_with_detected_hands:
             continue
         zone = _hand_zone_for(person)
         for obj in objects:

@@ -3,8 +3,16 @@ from egoownership.detection.persons import (
     _contains_face_center,
     _ego_hand_score,
     _pick_ego_hand_index,
+    assign_person_ids_across_frames,
+    attribute_hands,
 )
-from egoownership.schema import BBox
+from egoownership.schema import BBox, PersonDetection
+
+
+def _person(person_id: str, x_min: float, x_max: float) -> PersonDetection:
+    return PersonDetection(
+        bbox=BBox(x_min=x_min, y_min=0.2, x_max=x_max, y_max=0.9), person_id=person_id
+    )
 
 
 def test_contains_face_center_true_when_face_inside_box():
@@ -77,3 +85,93 @@ def test_giant_spurious_face_box_is_excluded_before_face_center_check():
         b for b in (giant_spurious_face, real_background_face) if b.area <= _MAX_FACE_AREA_RATIO
     ]
     assert not _contains_face_center(ego_body_box, plausible_faces)
+
+
+def test_tracking_keeps_one_id_per_person_when_left_right_order_swaps():
+    # detect_persons numbers left→right per frame, so two people crossing over
+    # renumbers both. Tracking must follow the boxes, not the ordering.
+    frames = [
+        [_person("person_1", 0.05, 0.25), _person("person_2", 0.60, 0.80)],
+        [_person("person_1", 0.55, 0.75), _person("person_2", 0.08, 0.28)],
+    ]
+    tracked = assign_person_ids_across_frames(frames)
+
+    left_at_t = next(p for p in tracked[1] if p.bbox.x_min < 0.4)
+    right_at_t = next(p for p in tracked[1] if p.bbox.x_min >= 0.4)
+    assert left_at_t.person_id == "person_1"
+    assert right_at_t.person_id == "person_2"
+
+
+def test_tracking_never_assigns_one_id_to_two_people_in_a_frame():
+    # Both detections overlap the same prior box; only the better match may
+    # inherit the id, otherwise held_by edges become ambiguous.
+    frames = [
+        [_person("person_1", 0.30, 0.60)],
+        [_person("person_1", 0.31, 0.61), _person("person_2", 0.28, 0.58)],
+    ]
+    tracked = assign_person_ids_across_frames(frames)
+
+    ids = [p.person_id for p in tracked[1]]
+    assert len(set(ids)) == 2
+
+
+def test_tracking_gives_a_new_id_to_someone_who_enters_late():
+    frames = [
+        [_person("person_1", 0.05, 0.25)],
+        [_person("person_1", 0.06, 0.26), _person("person_2", 0.70, 0.90)],
+    ]
+    tracked = assign_person_ids_across_frames(frames)
+
+    assert {p.person_id for p in tracked[0]} == {"person_1"}
+    assert {p.person_id for p in tracked[1]} == {"person_1", "person_2"}
+
+
+def test_tracking_reclaims_id_after_a_frame_of_occlusion():
+    frames = [
+        [_person("person_1", 0.05, 0.25)],
+        [],
+        [_person("person_1", 0.06, 0.26)],
+    ]
+    tracked = assign_person_ids_across_frames(frames)
+
+    assert tracked[2][0].person_id == tracked[0][0].person_id
+
+
+def test_tracking_does_not_mutate_the_input_detections():
+    frames = [[_person("person_1", 0.60, 0.80)], [_person("person_1", 0.05, 0.25)]]
+    tracked = assign_person_ids_across_frames(frames)
+
+    assert frames[1][0].person_id == "person_1"
+    assert tracked[1][0].person_id == "person_2"
+
+
+def _hand(x_min, y_min, x_max, y_max):
+    return BBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
+
+
+def test_hand_inside_a_person_body_belongs_to_that_person():
+    persons = [_person("person_2", 0.10, 0.45)]
+    hand = _hand(0.20, 0.60, 0.32, 0.75)
+    assert attribute_hands([hand], persons) == [("person_2", hand)]
+
+
+def test_hand_reaching_in_from_the_bottom_edge_belongs_to_the_wearer():
+    # No visible body owns it and it enters through a frame border — the
+    # signature of the camera wearer's own arm.
+    persons = [_person("person_1", 0.05, 0.30)]
+    hand = _hand(0.55, 0.82, 0.72, 1.0)
+    assert attribute_hands([hand], persons) == [("wearer", hand)]
+
+
+def test_floating_hand_with_no_owner_and_no_border_is_dropped():
+    assert attribute_hands([_hand(0.45, 0.40, 0.55, 0.50)], []) == []
+
+
+def test_hand_attribution_uses_tracked_person_ids():
+    # attribute_hands runs after tracking, so the owner id must be whatever
+    # tracking settled on, not the detector's per-frame numbering.
+    tracked = assign_person_ids_across_frames(
+        [[_person("person_1", 0.60, 0.85)], [_person("person_1", 0.05, 0.30)]]
+    )
+    hand = _hand(0.10, 0.60, 0.22, 0.78)
+    assert attribute_hands([hand], tracked[1]) == [("person_2", hand)]

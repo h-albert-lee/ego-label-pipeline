@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from egoownership.config import load_config, normalize_token
-from egoownership.detection.relations import build_scene_graph
+from egoownership.detection.persons import assign_person_ids_across_frames, attribute_hands
+from egoownership.detection.relations import HAND_LABEL, build_scene_graph
 from egoownership.detection.zones import person_relative_zones, static_zones
 from egoownership.schema import (
     BBox,
@@ -28,13 +29,12 @@ from egoownership.schema import (
 )
 
 
-PersonDetector = Callable[[Path], tuple[list[PersonDetection], BBox | None]]
+PersonDetector = Callable[[Path], tuple[list[PersonDetection], BBox | None, list[BBox]]]
 DecisionFn = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 _HELD_BY_WEARER_CONTAINMENT = 0.5
 
 _SHARED_OBJECTS = {
     "tissue",
-    "napkin",
     "sauce",
     "oil",
     "salt",
@@ -42,13 +42,6 @@ _SHARED_OBJECTS = {
     "sugar",
     "water",
     "food",
-    "dish",
-    "plate",
-    "bowl",
-    "chopstick",
-    "spoon",
-    "fork",
-    "knife",
     "trash",
     "bin",
     "pot",
@@ -64,10 +57,27 @@ _SHARED_OBJECTS = {
     "hotpot",
     "chopboard",
     "tablecloth",
-    "coaster",
     "spatula",
     "opener",
 }
+# Place-setting items: one per person at a meal, communal when set out for
+# everyone. In the datasets validated so far reviewers labeled these SHARED
+# regardless of where they sat (424 of 460 rows), so by default they behave like
+# any other communal-function object. Sources where every diner has their own
+# setting opt in via _PLACE_SETTING_DATASETS, and there placement decides.
+_TABLEWARE_OBJECTS = {
+    "plate",
+    "bowl",
+    "dish",
+    "napkin",
+    "coaster",
+    "spoon",
+    "fork",
+    "knife",
+    "chopstick",
+}
+_COMMUNAL_CONTAINER_HEADS = {"holder", "dispenser", "rack"}
+_PLACE_SETTING_DATASETS = frozenset({"a2pd"})
 _PERSONAL_OBJECTS = {
     "phone",
     "smartphone",
@@ -227,6 +237,7 @@ def build_evidence_label(
     decision_fn: DecisionFn | None = None,
 ) -> dict[str, Any]:
     cfg = load_config()
+    floor = _wearer_floor(row)
     target_label = _target_label(row)
     temporal = _build_temporal_evidence(row, target_label, person_detector=person_detector, cfg=cfg)
 
@@ -246,11 +257,14 @@ def build_evidence_label(
         persons = _persons_from_snapshot(current_snapshot)
         relation_summary = list(current_snapshot.get("relations") or [])
     elif frame_path.exists() and target_bbox.x_max > target_bbox.x_min:
+        hands: list[BBox] = []
         try:
-            persons, ego_hand_bbox = person_detector(frame_path) if person_detector is not None else ([], None)
+            persons, ego_hand_bbox, hands = (
+                person_detector(frame_path) if person_detector is not None else ([], None, [])
+            )
         except Exception as exc:  # noqa: BLE001
             detector_error = f"{type(exc).__name__}: {str(exc)[:300]}"
-        zones = person_relative_zones(persons, cfg.zones) if persons else static_zones(cfg.zones)
+        zones = person_relative_zones(persons, cfg.zones, wearer_floor=floor) if persons else static_zones(cfg.zones)
         target = ObjectDetection(
             label=target_label,
             bbox=target_bbox,
@@ -261,7 +275,11 @@ def build_evidence_label(
             tag="t",
             frame_path=str(frame_path),
             timestamp_sec=float(row.get("first_frame_sec") or row.get("catv_start_sec") or row.get("start_sec") or 0.0),
-            objects=[target],
+            objects=[target]
+            + [
+                ObjectDetection(label=HAND_LABEL, bbox=hand, instance_id=owner)
+                for owner, hand in attribute_hands(hands, persons)
+            ],
             persons=persons,
             zones=zones,
             narration=row.get("object_caption") or row.get("dense_caption_en"),
@@ -273,14 +291,15 @@ def build_evidence_label(
             for rel in frame.relations
             if rel.subject_id == "target" or rel.object_id == "target"
         ]
-        wearer_relation = _held_by_wearer_relation(target_bbox, ego_hand_bbox)
-        if wearer_relation is not None:
-            relation_summary.append(wearer_relation)
+        if not _has_wearer_hold(relation_summary):
+            wearer_relation = _held_by_wearer_relation(target_bbox, ego_hand_bbox)
+            if wearer_relation is not None:
+                relation_summary.append(wearer_relation)
 
     nearest_person = _nearest_person(target_bbox, persons)
     evidence = {
         "target_object": target_label,
-        "object_type": _object_type(target_label),
+        "object_type": _object_type(target_label, place_setting=_is_place_setting_source(row)),
         "target_zone": zone,
         "nearest_other_person": nearest_person,
         "person_count": len(persons),
@@ -320,6 +339,7 @@ def _decide_taxonomy_gt(row: dict[str, Any], evidence: dict[str, Any]) -> dict[s
     }.get(zone, f"the {zone} area")
     _obj_type_desc = {
         "shared": "a shared-use object",
+        "tableware": "a place-setting item",
         "personal": "a personal object",
         "generic_object": "a generic object",
     }.get(object_type, object_type)
@@ -456,13 +476,20 @@ def _decide_taxonomy_gt(row: dict[str, Any], evidence: dict[str, Any]) -> dict[s
                 f"The target is in {_zone_desc}, close to the camera wearer, "
                 f"and no actor cue points to another person."
             )
-        elif zone in {"shared_zone", "center_table"} and object_type == "personal" and temporal.get("ownership_trajectory") == "ego_to_shared":
+        elif zone in {"shared_zone", "center_table"} and object_type in {"personal", "tableware"} and temporal.get("ownership_trajectory") == "ego_to_shared":
             gt = OwnershipLabel.MINE
             contextual = True
             rationale = (
                 f"The target is {_obj_type_desc} now resting in {_zone_desc} with no current actor cue, but it "
                 f"was in the camera-wearer's zone earlier in the clip — relocating it to a shared surface doesn't "
                 f"relinquish ownership."
+            )
+        elif zone in {"shared_zone", "center_table"} and object_type == "tableware":
+            gt = OwnershipLabel.SHARED
+            rationale = (
+                f"The target is {_obj_type_desc} resting in {_zone_desc}, away from every person's "
+                "own space, with no actor or hand pointing to anyone — it was set out for the table, "
+                "not in front of one person."
             )
         elif zone in {"shared_zone", "center_table"}:
             gt = OwnershipLabel.AMBIGUOUS
@@ -695,6 +722,14 @@ def _sentence(value: Any) -> str:
     if text[-1] not in ".!?":
         text += "."
     return text
+
+
+def _wearer_floor(row: dict[str, Any]) -> str:
+    return "median" if _is_place_setting_source(row) else "lowest"
+
+
+def _is_place_setting_source(row: dict[str, Any]) -> bool:
+    return str(row.get("dataset") or row.get("source_dataset") or "").lower() in _PLACE_SETTING_DATASETS
 
 
 def _is_ego4d_row(row: dict[str, Any]) -> bool:
@@ -993,11 +1028,17 @@ def _nearest_person(bbox: BBox, persons: list[PersonDetection]) -> dict[str, Any
     }
 
 
-def _object_type(label: str) -> str:
+def _object_type(label: str, *, place_setting: bool = False) -> str:
     norm = normalize_token(label)
     parts = set(norm.split("_"))
+    # A holder or dispenser stays communal even when what it holds (a napkin, a
+    # coaster, a knife) is a per-person item.
+    if place_setting and norm.split("_")[-1] in _COMMUNAL_CONTAINER_HEADS:
+        return "shared"
     if norm in _SHARED_OBJECTS or parts & _SHARED_OBJECTS:
         return "shared"
+    if norm in _TABLEWARE_OBJECTS or parts & _TABLEWARE_OBJECTS:
+        return "tableware" if place_setting else "shared"
     if norm in _PERSONAL_OBJECTS or parts & _PERSONAL_OBJECTS:
         return "personal"
     return "generic_object"
@@ -1055,12 +1096,14 @@ def _build_temporal_evidence(
     person_detector: PersonDetector | None,
     cfg: Any,
 ) -> dict[str, Any]:
+    floor = _wearer_floor(row)
     temporal_objects = dict(row.get("temporal_target_objects") or {})
     frame_times = dict(row.get("frame_times_sec") or {})
     frames: list[FrameDetections] = []
     detector_error: str | None = None
     analyzed_tags: list[str] = []
     ego_hand_by_tag: dict[str, BBox | None] = {}
+    hands_by_tag: dict[str, list[BBox]] = {}
     target_bbox_by_tag: dict[str, BBox] = {}
 
     for tag in _TEMPORAL_FRAME_TAGS:
@@ -1078,14 +1121,16 @@ def _build_temporal_evidence(
         )
         persons: list[PersonDetection] = []
         ego_hand_bbox: BBox | None = None
+        hands: list[BBox] = []
         if person_detector is not None and frame_path is not None and frame_path.exists():
             try:
-                persons, ego_hand_bbox = person_detector(frame_path)
+                persons, ego_hand_bbox, hands = person_detector(frame_path)
             except Exception as exc:  # noqa: BLE001
                 detector_error = f"{type(exc).__name__}: {str(exc)[:300]}"
         ego_hand_by_tag[tag] = ego_hand_bbox
+        hands_by_tag[tag] = hands
         target_bbox_by_tag[tag] = bbox
-        zones = person_relative_zones(persons, cfg.zones) if persons else static_zones(cfg.zones)
+        zones = person_relative_zones(persons, cfg.zones, wearer_floor=floor) if persons else static_zones(cfg.zones)
         frames.append(
             FrameDetections(
                 tag=tag,
@@ -1122,6 +1167,29 @@ def _build_temporal_evidence(
             "detector_error": detector_error,
         }
 
+    # Link per-frame person detections into tracks before the scene graph is
+    # built, so a ``held_by`` edge naming person_2 means the same individual at
+    # t-2 and t. detect_persons numbers people left→right within a single
+    # frame, which renumbers everyone as soon as someone shifts position.
+    tracked_persons = assign_person_ids_across_frames([fd.persons for fd in frames])
+    frames = [
+        fd.model_copy(
+            update={
+                "persons": persons,
+                # Attribute hands only now that person ids are tracked, so a
+                # hand's owner id means the same individual across the clip.
+                # They go in as objects because possession_relations derives
+                # `held_by` from hand-vs-object overlap.
+                "objects": fd.objects
+                + [
+                    ObjectDetection(label=HAND_LABEL, bbox=hand, instance_id=owner)
+                    for owner, hand in attribute_hands(hands_by_tag.get(fd.tag) or [], persons)
+                ],
+            }
+        )
+        for fd, persons in zip(frames, tracked_persons)
+    ]
+
     graph_frames = build_scene_graph(frames)
     snapshots: dict[str, dict[str, Any]] = {}
     frame_zones: dict[str, str] = {}
@@ -1135,11 +1203,12 @@ def _build_temporal_evidence(
             for rel in fd.relations
             if rel.subject_id == "target" or rel.object_id == "target"
         ]
-        wearer_relation = _held_by_wearer_relation(
-            target_bbox_by_tag.get(fd.tag, target_obj.bbox), ego_hand_by_tag.get(fd.tag)
-        )
-        if wearer_relation is not None:
-            relations.append(wearer_relation)
+        if not _has_wearer_hold(relations):
+            wearer_relation = _held_by_wearer_relation(
+                target_bbox_by_tag.get(fd.tag, target_obj.bbox), ego_hand_by_tag.get(fd.tag)
+            )
+            if wearer_relation is not None:
+                relations.append(wearer_relation)
         snapshots[fd.tag] = {
             "tag": fd.tag,
             "target_zone": zone,
@@ -1194,15 +1263,22 @@ def _held_by_person(relations: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _has_wearer_hold(relations: list[dict[str, Any]]) -> bool:
+    return any(
+        rel.get("predicate") == "held_by" and rel.get("object_id") == "wearer" for rel in relations
+    )
+
+
 def _held_by_wearer_relation(target_bbox: BBox, ego_hand_bbox: BBox | None) -> dict[str, Any] | None:
-    """Containment check against the wearer's own detected hand/arm box.
+    """Containment check against the wearer's own arm box — the fallback for
+    frames where the ``"a hand."`` query found nothing.
 
     The ego-hand box comes from Grounding DINO's "a person." prompt firing on
-    an arm reaching into frame — it's a loose region covering the whole
-    reach, not a tight hand-only box, so it's often much larger than a small
-    held object. Plain IoU penalizes that size mismatch too harshly (a phone
-    fully inside a wide forearm box can score IoU < 0.05); what actually
-    matters is how much of the *target* sits inside it.
+    an arm reaching into frame: a loose region covering the whole reach, not a
+    tight hand box, so it is often much larger than a small held object. Plain
+    IoU penalizes that size mismatch too harshly (a phone fully inside a wide
+    forearm box can score IoU < 0.05); what matters is how much of the *target*
+    sits inside it.
     """
     if ego_hand_bbox is None or target_bbox.area <= 0:
         return None

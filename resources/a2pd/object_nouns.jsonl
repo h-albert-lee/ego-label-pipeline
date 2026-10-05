@@ -1,0 +1,91 @@
+{"noun": "glass", "count": 84, "rank": 1, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "plate", "count": 83, "rank": 2, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "sandwich", "count": 83, "rank": 3, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "napkin", "count": 83, "rank": 4, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "coaster", "count": 73, "rank": 5, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "potato chip", "count": 72, "rank": 6, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "board game box", "count": 61, "rank": 7, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "playing card", "count": 53, "rank": 8, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "book", "count": 52, "rank": 9, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "tray", "count": 40, "rank": 10, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "remote control", "count": 40, "rank": 11, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "bottle", "count": 29, "rank": 12, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "napkin holder", "count": 24, "rank": 13, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "vase", "count": 23, "rank": 14, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "flower", "count": 18, "rank": 15, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "bowl", "count": 15, "rank": 16, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "toaster", "count": 14, "rank": 17, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "cup", "count": 14, "rank": 18, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "container", "count": 12, "rank": 19, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "paper towel holder", "count": 9, "rank": 20, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "coffee maker", "count": 9, "rank": 21, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "drink", "count": 9, "rank": 22, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "salt shaker", "count": 9, "rank": 23, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "box", "count": 9, "rank": 24, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "paper towel roll", "count": 7, "rank": 25, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "bag", "count": 7, "rank": 26, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "card", "count": 7, "rank": 27, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "knife block", "count": 6, "rank": 28, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "cutting board", "count": 6, "rank": 29, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "chip", "count": 5, "rank": 30, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "knife", "count": 5, "rank": 31, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "scrabble box", "count": 5, "rank": 32, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "paper", "count": 4, "rank": 33, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "fork", "count": 3, "rank": 34, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "wooden bowl", "count": 3, "rank": 35, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "pepper shaker", "count": 3, "rank": 36, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "candle", "count": 3, "rank": 37, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "candle holder", "count": 3, "rank": 38, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "cactus", "count": 3, "rank": 39, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "coaster holder", "count": 3, "rank": 40, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "card deck box", "count": 3, "rank": 41, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "bracelet", "count": 2, "rank": 42, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "paper napkin holder", "count": 2, "rank": 43, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "basket", "count": 2, "rank": 44, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "phone", "count": 2, "rank": 45, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "picture frame", "count": 2, "rank": 46, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "pitcher", "count": 2, "rank": 47, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "mask", "count": 2, "rank": 48, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "game board", "count": 2, "rank": 49, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "smartphone", "count": 1, "rank": 50, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "guitar", "count": 1, "rank": 51, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "toothpick", "count": 1, "rank": 52, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "sandwich holder", "count": 1, "rank": 53, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "shelf", "count": 1, "rank": 54, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "electric kettle", "count": 1, "rank": 55, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "blender", "count": 1, "rank": 56, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "air fryer", "count": 1, "rank": 57, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "bottle opener", "count": 1, "rank": 58, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "flower arrangement", "count": 1, "rank": 59, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "microwave", "count": 1, "rank": 60, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "oven", "count": 1, "rank": 61, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "refrigerator", "count": 1, "rank": 62, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "dish towel", "count": 1, "rank": 63, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "fruit holder", "count": 1, "rank": 64, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "tableware holder", "count": 1, "rank": 65, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "metal rack", "count": 1, "rank": 66, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "watch", "count": 1, "rank": 67, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "dish rack", "count": 1, "rank": 68, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "dishwasher", "count": 1, "rank": 69, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "utensil holder", "count": 1, "rank": 70, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "spoon", "count": 1, "rank": 71, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "plant", "count": 1, "rank": 72, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "wooden stool", "count": 1, "rank": 73, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "round ottoman", "count": 1, "rank": 74, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "cracker", "count": 1, "rank": 75, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "bread bag", "count": 1, "rank": 76, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "pot", "count": 1, "rank": 77, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "wire napkin holder", "count": 1, "rank": 78, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "sunglass", "count": 1, "rank": 79, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "water pitcher", "count": 1, "rank": 80, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "round woven mat", "count": 1, "rank": 81, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "wooden tray", "count": 1, "rank": 82, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "board game board", "count": 1, "rank": 83, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "round cushion", "count": 1, "rank": 84, "kept": false, "example": "", "filter_reason": "llm_not_tabletop_object"}
+{"noun": "glass jar", "count": 1, "rank": 85, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "game tile", "count": 1, "rank": 86, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "dvd case", "count": 1, "rank": 87, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "board game", "count": 1, "rank": 88, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "hat", "count": 1, "rank": 89, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "can", "count": 1, "rank": 90, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}
+{"noun": "paper cup", "count": 1, "rank": 91, "kept": true, "example": "", "filter_reason": "llm_tabletop_object"}

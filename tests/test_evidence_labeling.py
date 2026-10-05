@@ -1,3 +1,4 @@
+from egoownership.schema import BBox
 from egoownership.evidence_labeling import (
     _caption_cues,
     _caption_interaction_evidence,
@@ -8,7 +9,6 @@ from egoownership.evidence_labeling import (
     _narration_actor_prefix,
     _summarize_context_change,
 )
-from egoownership.schema import BBox
 
 
 def _base_evidence(zone: str, temporal: dict) -> dict:
@@ -184,38 +184,6 @@ def test_personal_object_in_shared_zone_without_trajectory_stays_ambiguous():
     decision = _decide_taxonomy_gt({"verb": "", "object_caption": "no actor mentioned"}, evidence)
     assert decision["ground_truth"] == "AMBIGUOUS"
     assert decision["taxonomy"] == "D"
-
-
-def test_held_by_wearer_relation_fires_on_full_containment():
-    target = BBox(x_min=0.40, y_min=0.40, x_max=0.60, y_max=0.60)
-    ego_hand = BBox(x_min=0.35, y_min=0.35, x_max=0.65, y_max=0.65)
-    rel = _held_by_wearer_relation(target, ego_hand)
-    assert rel == {"subject_id": "target", "object_id": "wearer", "predicate": "held_by", "score": rel["score"]}
-    assert rel["score"] == 1.0
-
-
-def test_held_by_wearer_relation_fires_on_small_target_inside_large_loose_hand_box():
-    # Regression case: the ego-hand box from "a person." firing on a reaching
-    # arm is often much larger than the held object (e.g. spans half the
-    # frame), so plain IoU would be tiny even though the object sits fully
-    # inside it. Containment should still catch this.
-    target = BBox(x_min=0.538, y_min=0.489, x_max=0.619, y_max=0.647)
-    ego_hand = BBox(x_min=0.265, y_min=0.495, x_max=0.852, y_max=0.993)
-    assert target.iou(ego_hand) < 0.05  # confirms IoU alone would have missed it
-    rel = _held_by_wearer_relation(target, ego_hand)
-    assert rel is not None
-    assert rel["object_id"] == "wearer"
-
-
-def test_held_by_wearer_relation_none_when_no_overlap():
-    target = BBox(x_min=0.0, y_min=0.0, x_max=0.1, y_max=0.1)
-    ego_hand = BBox(x_min=0.8, y_min=0.8, x_max=0.9, y_max=0.9)
-    assert _held_by_wearer_relation(target, ego_hand) is None
-
-
-def test_held_by_wearer_relation_none_when_no_ego_hand_detected():
-    target = BBox(x_min=0.4, y_min=0.4, x_max=0.6, y_max=0.6)
-    assert _held_by_wearer_relation(target, None) is None
 
 
 def test_tier1_held_by_wearer_yields_mine_not_person_k():
@@ -428,3 +396,94 @@ def test_caption_interaction_evidence_uses_object_caption_for_non_ego4d():
     }
     evidence = _caption_interaction_evidence(row)
     assert "plate" in evidence
+
+
+def test_held_by_wearer_relation_fires_on_full_containment():
+    target = BBox(x_min=0.40, y_min=0.40, x_max=0.60, y_max=0.60)
+    ego_hand = BBox(x_min=0.35, y_min=0.35, x_max=0.65, y_max=0.65)
+    rel = _held_by_wearer_relation(target, ego_hand)
+    assert rel == {"subject_id": "target", "object_id": "wearer", "predicate": "held_by", "score": 1.0}
+
+
+def test_held_by_wearer_relation_fires_on_small_target_inside_large_loose_hand_box():
+    # The ego-hand box from "a person." firing on a reaching arm is often much
+    # larger than the held object, so plain IoU would be tiny even though the
+    # object sits fully inside it. Containment should still catch this.
+    target = BBox(x_min=0.538, y_min=0.489, x_max=0.619, y_max=0.647)
+    ego_hand = BBox(x_min=0.265, y_min=0.495, x_max=0.852, y_max=0.993)
+    assert target.iou(ego_hand) < 0.05  # confirms IoU alone would have missed it
+    rel = _held_by_wearer_relation(target, ego_hand)
+    assert rel is not None
+    assert rel["object_id"] == "wearer"
+
+
+def test_held_by_wearer_relation_none_when_no_overlap():
+    target = BBox(x_min=0.0, y_min=0.0, x_max=0.1, y_max=0.1)
+    ego_hand = BBox(x_min=0.8, y_min=0.8, x_max=0.9, y_max=0.9)
+    assert _held_by_wearer_relation(target, ego_hand) is None
+
+
+def test_held_by_wearer_relation_none_when_no_ego_hand_detected():
+    target = BBox(x_min=0.4, y_min=0.4, x_max=0.6, y_max=0.6)
+    assert _held_by_wearer_relation(target, None) is None
+
+
+def _plate_evidence(zone, *, place_setting):
+    from egoownership.evidence_labeling import _object_type
+
+    return {
+        "target_object": "plate",
+        "object_type": _object_type("plate", place_setting=place_setting),
+        "target_zone": zone,
+        "nearest_other_person": None,
+        "person_count": 3,
+        "visible_other_person": True,
+        "relations": [],
+        "caption_cues": {
+            "ego_actor": False, "other_actor": False, "ambiguous": False, "shared_area": False,
+            "shared_use": False, "temporal": False, "moved_or_state_changed": False,
+            "transfer": False, "serving": False, "prior_possession": False, "shared_origin": False,
+            "ownership_history": False, "conflict_cue": False,
+        },
+        "detector_error": None,
+        "temporal": {},
+    }
+
+
+def test_tableware_is_communal_by_default_to_match_the_validated_labels():
+    # Reviewers labeled these SHARED wherever they sat (424 of 460 rows), so the
+    # default must not reinterpret them.
+    from egoownership.evidence_labeling import _object_type
+
+    assert _object_type("plate") == "shared"
+    assert _object_type("napkin") == "shared"
+    ev = _plate_evidence("ego_zone", place_setting=False)
+    assert _decide_taxonomy_gt({"verb": ""}, ev)["ground_truth"] == "SHARED"
+
+
+def test_place_setting_source_lets_placement_decide():
+    from egoownership.evidence_labeling import _object_type
+
+    assert _object_type("plate", place_setting=True) == "tableware"
+    gt = lambda zone: _decide_taxonomy_gt({"verb": ""}, _plate_evidence(zone, place_setting=True))["ground_truth"]
+    assert gt("ego_zone") == "MINE"
+    assert gt("other_person_zone") == "PERSON_k"
+    assert gt("center_table") == "SHARED"
+
+
+def test_holders_stay_communal_in_place_setting_mode():
+    from egoownership.evidence_labeling import _object_type
+
+    assert _object_type("napkin holder", place_setting=True) == "shared"
+    assert _object_type("napkin holder") == "shared"
+    # an unrelated "holder" outside that mode is untouched
+    assert _object_type("key holder") == "personal"
+
+
+def test_only_the_a2pd_source_opts_into_place_settings():
+    from egoownership.evidence_labeling import _is_place_setting_source
+
+    assert _is_place_setting_source({"dataset": "a2pd"})
+    assert not _is_place_setting_source({"dataset": "ego4d"})
+    assert not _is_place_setting_source({"source_dataset": "egolife"})
+    assert not _is_place_setting_source({})

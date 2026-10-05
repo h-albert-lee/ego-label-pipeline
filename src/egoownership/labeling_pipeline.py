@@ -1355,7 +1355,7 @@ def load_object_noun_allowlist(path: Path | None) -> set[str] | None:
         noun = normalize_object_noun(str(row.get("noun") or ""))
         if not noun:
             continue
-        if row.get("keep_object_noun") is False:
+        if row.get("keep_object_noun") is False or row.get("kept") is False:
             continue
         nouns.add(noun)
     return nouns
@@ -2315,6 +2315,7 @@ def labels_row_to_scene_record(row: dict[str, Any], *, crosscheck: dict[str, Any
     # them here, even though the client-side rendering code was correct) ----
     from egoownership.config import load_config
     from egoownership.detection.zones import person_relative_zones, static_zones
+    from egoownership.evidence_labeling import _wearer_floor
 
     _cfg = load_config()
     _frame_snapshots = (stored_evidence or {}).get("temporal", {}).get("frame_snapshots") or {}
@@ -2352,7 +2353,11 @@ def labels_row_to_scene_record(row: dict[str, Any], *, crosscheck: dict[str, Any
             for r in raw_relations
             if isinstance(r, dict)
         ]
-        zones = person_relative_zones(persons, _cfg.zones) if persons else static_zones(_cfg.zones)
+        zones = (
+            person_relative_zones(persons, _cfg.zones, wearer_floor=_wearer_floor(row))
+            if persons
+            else static_zones(_cfg.zones)
+        )
         return persons, relations, zones
 
     # ---- frames ----
